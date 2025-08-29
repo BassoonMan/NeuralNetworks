@@ -1,11 +1,6 @@
-import math
-import random
 import matplotlib.pyplot as plt
 from matplotlib import animation
 import time
-from nonArrayBased.MyNeuron import neuron as Neuron
-from nonArrayBased.MyLayer import layer as Layer
-from nonArrayBased.MyNetwork import network as Network
 from ArrayBased.ArrayNetwork import ArrayNetworkFeedforward as ArrayNetwork
 import numpy as np
 
@@ -35,8 +30,8 @@ class Word2Vec:
         self.windowSize = windowSize
         with open("inputCorpus.txt", 'r', encoding='utf-8') as file:
             self.corpus = self.preprocess(file.read())
+            
         data = {}
-
         for sentence in self.corpus:
             for word in sentence:
                 if word not in data:
@@ -44,6 +39,7 @@ class Word2Vec:
                 else:
                     data[word] += 1
         # This section counts frequency of words inside the corpus
+        print(data)
 
         self.uniqueWordNum = len(data)
 
@@ -95,7 +91,7 @@ class Word2Vec:
                 rawOutputs = self.net.evaluateNetwork(inputs)
                 outputs = softmax(rawOutputs)
                 #print(outputs)
-                diffs = np.subtract(targets, outputs)
+                diffs = np.subtract(targets, outputs) # This seems to be the issue. Skip gram doesn't quite use difference, it uses
                 self.net.updateNetworkGeneralizedDelta(inputs, diffs, learnRate)
                 C = 0
                 #Loss is 
@@ -220,7 +216,8 @@ class Word2Vec:
     
 if __name__ == "__main__":
     model = Word2Vec(30, 10)
-    #model.train(1000)
+    #model.train(10)
     #model.animateEmbeddings(1000)
     #model.writeEmbedding()
-    print(model.predict("trump", 2))
+    #print(model.predict("trump", 2))
+# Rawr X3 *nuzzles* How are you? *pounces on you* you're so warm o3o *notices you have a bulge* someone's happy! *nuzzles your necky wecky* ~murr~ hehe ;) *rubbies your bulgy wolgy* you're so big! *rubbies more on your bulgy wolgy* it doesn't stop growing .///. *kisses you and licks your neck* daddy likes ;) *nuzzle wuzzle* I hope daddy likes *wiggles butt and squirms* I wanna see your big daddy meat! *wiggles butt* I have a little itch o3o *wags tails* can you please get my itch? *put paws on your chest* nyea~ it's a seven inch itch *rubs your chest* can you pwease? *squirms* pwetty pwease? :( I need to be punished *runs paws down your chest and bites lip* like, I need to be punished really good *paws on your bulge as I lick my lips* I'm getting thirsty. I could go for some milk *unbuttons your pants as my eyes glow* you smell so musky ;) *licks shaft* mmmmmmmmmmmmmmmmmmm so musky ;) *drools all over your cawk* your daddy meat. I like. Mister fuzzy balls. *puts snout on balls and inhales deeply* oh my gawd. I'm so hard *rubbies your bulgy wolgy* *licks balls* punish me daddy nyea~ *squirms more and wiggles butt* I9/11 lovewas an yourinside muskyjob goodness *bites lip* please punish me *licks lips* nyea~ *suckles on your tip* so good *licks pre off your cock* salty goodness~ *eyes roll back and goes balls deep* 
