@@ -3,10 +3,12 @@ import numpy as np
 
 from nltk.corpus import stopwords 
 import nltk
-nltk.download('punkt_tab')
-nltk.download('stopwords')
+#nltk.download('punkt_tab')
+#nltk.download('stopwords')
 import nltk
 import string
+
+import time
 
 from scipy.special import softmax
 
@@ -131,9 +133,12 @@ class Word2Vec2:
             learnRate *= 1/((1+learnRate*i))
 
 if __name__ == "__main__":
+    startTime = time.perf_counter()
     model = Word2Vec2(2, 2)
     model.preprocess()
     model.train(1000)
+    endTime = time.perf_counter()
+    print("end, time elapsed: ", endTime-startTime)
     model.writeEmbeddings()
     print(model.predict("trump", 2))
     print(model.predict("joshua", 2))
