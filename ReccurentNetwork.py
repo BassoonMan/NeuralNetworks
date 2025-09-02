@@ -48,6 +48,7 @@ class RecurrentNetwork:
                 tokens.append(word.lower())
 
         output = self.passThrough(tokens)
+
         wordNProb = []
         for i in range(self.wordCount):
             wordNProb.append([output[i][0], self.words[i]])
@@ -56,10 +57,7 @@ class RecurrentNetwork:
 
     def passThrough(self, tokens):
         for token in tokens:
-            encoding = np.zeros((self.wordCount, 1))
-            encoding[self.wordIndex[token]] = 1
-            embeddedVector = np.dot(self.embeddingMatrix, encoding)
-            self.hiddenState = np.dot(self.hiddenWeights, self.hiddenState) + np.dot(self.embeddingWeights, embeddedVector)
+            self.updateHidden(token)
 
         output = softmax(np.dot(self.outPutWeights, self.hiddenState))
         return output
@@ -78,14 +76,29 @@ class RecurrentNetwork:
             tokenizedSentences.append(tokenizedSentence)
 
         for i in range(epochs):
-            for sentence in sentences:
+            for sentence in tokenizedSentences:
                 curSentence = []
                 length = len(sentence)
-                for j in range(len(length)):
+                for j in range(length):
                     curSentence.append(sentence[j])
-                    output = self.passThrough(sentence)
+                    rawOutput = self.passThrough(curSentence)
+                    output = softmax(rawOutput)
+
+                    encoding = np.zeros((self.wordCount, 1))
+                    encoding[self.wordIndex[sentence[j+1]]] = 1
+
+                    diffs = np.subtract(encoding, output)
+                    changeInOutputWeight = np.dot(diffs, self.hiddenState.T)
+                    changeInHiddenWeight = np.zeros(())
+                    for k in range(j):
+                        pass
                     #Implement Backpropagation through time
-        pass
+
+    def updateHidden(self, token):
+        encoding = np.zeros((self.wordCount, 1))
+        encoding[self.wordIndex[token]] = 1
+        embeddedVector = np.dot(self.embeddingMatrix, encoding)
+        self.hiddenState = np.atleast_2d(list(map(sigmoid ,np.dot(self.hiddenWeights, self.hiddenState) + np.dot(self.embeddingWeights, embeddedVector)))).T
 
 
 if __name__ == '__main__':
@@ -110,6 +123,7 @@ if __name__ == '__main__':
             'ugly',
             ]
     net = RecurrentNetwork(2, 2, 6, word2Index, matrix, words)
+    net.train(1)
     net.predictNext("Trump is")
 
 
