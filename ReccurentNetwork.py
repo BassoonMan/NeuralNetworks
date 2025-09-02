@@ -32,9 +32,9 @@ class RecurrentNetwork:
     words = []
 
     def __init__(self, embeddingDim, hiddenDim, wordCount, wordIndex, embeddingMatrix, words):
-        self.hiddenWeights = np.random.rand(hiddenDim, hiddenDim)
-        self.embeddingWeights = np.random.rand(hiddenDim, embeddingDim)
-        self.outPutWeights = np.random.rand(wordCount, hiddenDim)
+        self.hiddenWeights = np.random.uniform(-.8, .8, (hiddenDim, hiddenDim))
+        self.embeddingWeights = np.random.uniform(-.8, .8, (hiddenDim, embeddingDim))
+        self.outPutWeights = np.random.uniform(-.8, .8, (wordCount, hiddenDim))
         self.hiddenState = np.random.rand(hiddenDim, 1)
         self.wordIndex = wordIndex
         self.wordCount = wordCount
