@@ -129,12 +129,12 @@ class Word2Vec2:
                         loss -= rawOutput[0][k]
                 loss += self.wordCount * np.log(np.sum(np.exp(rawOutput)))
             loss /= len(self.centerWords)
-            print("Ephoch: ", i, " Loss: ", loss)
+            print("Epoch: ", i, " Loss: ", loss)
             learnRate *= 1/((1+learnRate*i))
 
 if __name__ == "__main__":
     startTime = time.perf_counter()
-    model = Word2Vec2(2, 2)
+    model = Word2Vec2(4, 2)
     model.preprocess()
     model.train(1000)
     endTime = time.perf_counter()
