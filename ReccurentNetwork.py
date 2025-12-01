@@ -30,6 +30,8 @@ class RecurrentNetwork:
     wordIndex = []
     wordCount = 0
     words = []
+    hiddenDim = 0
+    embeddingDim = 0
 
     def __init__(self, embeddingDim, hiddenDim, wordCount, wordIndex, embeddingMatrix, words):
         self.hiddenWeights = np.random.uniform(-.8, .8, (hiddenDim, hiddenDim))
@@ -40,6 +42,8 @@ class RecurrentNetwork:
         self.wordCount = wordCount
         self.embeddingMatrix = embeddingMatrix
         self.words = words
+        self.hiddenDim = hiddenDim
+        self.embeddingDim = embeddingDim
 
     def predictNext(self, inputString):
         tokens = []
@@ -81,17 +85,24 @@ class RecurrentNetwork:
                 length = len(sentence)
                 for j in range(length):
                     curSentence.append(sentence[j])
-                    rawOutput = self.passThrough(curSentence)
-                    output = softmax(rawOutput)
+                    hiddenStorage = [self.hiddenState]
+                    for token in curSentence:
+                        self.updateHidden(token)
+                        hiddenStorage.append(self.hiddenState)
+                    output = softmax(self.hiddenState)
 
                     encoding = np.zeros((self.wordCount, 1))
                     encoding[self.wordIndex[sentence[j+1]]] = 1
 
                     diffs = np.subtract(encoding, output)
-                    changeInOutputWeight = np.dot(diffs, self.hiddenState.T)
-                    changeInHiddenWeight = np.zeros(())
+                    changeInOutputWeight = np.dot(np.negative(diffs), self.hiddenState.T)
+                    changeInHiddenWeight = np.zeros((self.hiddenDim, self.hiddenDim))
                     for k in range(j):
-                        pass
+                        HtOverWh = np.ones((self.hiddenDim, 1))
+                        for n in range(len(curSentence) - 1 - k):
+                            HtOverWh = np.multiply(HtOverWh, hiddenStorage[n])
+                        HtOverWh = np.dot(np.linalg.matrix_power(self.hiddenWeights, k))
+                        changeInHiddenWeight = np.sum(changeInHiddenWeight, np.dot(np.dot(np.negative(diffs), )))
                     #Implement Backpropagation through time
 
     def updateHidden(self, token):
