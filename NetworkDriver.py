@@ -196,7 +196,7 @@ if __name__ == "__main__":
     #networkB.printNetwork()
     #print("GAP")
 
-    num = 100000
+    num = 0
     errorTrack = []
     testNum = 0
     #networkA.printInWeights()
@@ -222,26 +222,30 @@ if __name__ == "__main__":
 
     endTime = time.perf_counter()
     print("end, time elapsed: ", endTime-startTime)
-    plt.plot(errorTrack)
-    plt.show()
-    networkB.printNetwork()
-    inputs = testSet3[1][0]
-    outputs = networkB.evaluateNetwork(inputs)
-    print("inputs: ", inputs)
-    print("outputs: ", outputs)
-    inputs = testSet3[0][0]
-    outputs = networkB.evaluateNetwork(inputs)
-    print("inputs: ", inputs)
-    print("outputs: ", outputs)
-    inputs = testSet3[2][0]
-    outputs = networkB.evaluateNetwork(inputs)
-    print("inputs: ", inputs)
-    print("outputs: ", outputs)
-    inputs = testSet3[3][0]
-    outputs = networkB.evaluateNetwork(inputs)
-    print("inputs: ", inputs)
-    print("outputs: ", outputs)
-    inputs = testSet3[10][0]
-    outputs = networkB.evaluateNetwork(inputs)
-    print("inputs: ", inputs)
-    print("outputs: ", outputs)
+    # plt.plot(errorTrack)
+    # plt.show()
+    # networkB.printNetwork()
+    # inputs = testSet3[1][0]
+    # outputs = networkB.evaluateNetwork(inputs)
+    # print("inputs: ", inputs)
+    # print("outputs: ", outputs)
+    # inputs = testSet3[0][0]
+    # outputs = networkB.evaluateNetwork(inputs)
+    # print("inputs: ", inputs)
+    # print("outputs: ", outputs)
+    # inputs = testSet3[2][0]
+    # outputs = networkB.evaluateNetwork(inputs)
+    # print("inputs: ", inputs)
+    # print("outputs: ", outputs)
+    # inputs = testSet3[3][0]
+    # outputs = networkB.evaluateNetwork(inputs)
+    # print("inputs: ", inputs)
+    # print("outputs: ", outputs)
+    # inputs = testSet3[10][0]
+    # outputs = networkB.evaluateNetwork(inputs)
+    # print("inputs: ", inputs)
+    # print("outputs: ", outputs)
+
+    for bptt_step in np.arange(max(0, 2), 7)[::-1]:
+        print(bptt_step)
+

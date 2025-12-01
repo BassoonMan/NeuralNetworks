@@ -76,6 +76,7 @@ class Word2Vec:
             sentence = sentences[i].split() # Takes a sentance and splits it into individual words
             x = [word.strip(string.punctuation) for word in sentence if word not in stop_words] # Removes punctuation words
             x = [word.lower() for word in x] # to lowercase
+            print(x)
             training_data.append(x)
         return training_data
     
@@ -147,7 +148,20 @@ class Word2Vec:
                         loss += -1*rawOutputs[0][m]
                         C += 1
                 loss += C*np.log(np.sum(np.exp(rawOutputs)))
-            print("epoch ", i, " loss = ", loss)
+            if (i % 10 == 0):
+                C = 0
+                for m in range(self.uniqueWordNum):
+                    if(self.yTrain[j][m]):
+                        loss += -1*rawOutputs[0][m]
+                        C += 1
+                loss += C*np.log(np.sum(np.exp(rawOutputs)))
+                print("Epoch: ", i, " Loss: ", loss)
+                errorTrack.append(loss)
+                # adjust the learning rate if loss increases
+                if (len(errorTrack) > 1 and errorTrack[-1] > errorTrack[-2]):
+                    self.learnRate = self.learnRate * 0.5
+                    print("setting learning rate to %f" %(self.learnRate))
+            # print("epoch ", i, " loss = ", loss)
             self.learnRate *= 1/((1+self.learnRate*(i + 1)))
             wordEmbedding = self.net.outputEmbedding()
             labels = np.array(list(self.wordIndex.keys()))
@@ -164,7 +178,6 @@ class Word2Vec:
             scatter.set_offsets(combined.T)
             for i, txt in enumerate(labels):
                 annotations[i].xy = (wordX[i], wordY[i])
-            errorTrack.append(loss)
             ax.set_xlim([xneg, xpos])
             ax.set_ylim([yneg, ypos])
             #print([-xneg, xpos])
@@ -215,10 +228,10 @@ class Word2Vec:
 
     
 if __name__ == "__main__":
-    model = Word2Vec(2, 3)
-    #model.train(10)
-    model.animateEmbeddings(100)
-    #model.writeEmbedding()
-    print(model.predict("joshua", 2))
-    print(model.predict("trump", 2))
+    model = Word2Vec(20, 4)
+    #model.train(100)
+    model.animateEmbeddings(1000)
+    model.writeEmbedding()
+    # print(model.predict("joshua", 2))
+    # print(model.predict("trump", 2))
 # Rawr X3 *nuzzles* How are you? *pounces on you* you're so warm o3o *notices you have a bulge* someone's happy! *nuzzles your necky wecky* ~murr~ hehe ;) *rubbies your bulgy wolgy* you're so big! *rubbies more on your bulgy wolgy* it doesn't stop growing .///. *kisses you and licks your neck* daddy likes ;) *nuzzle wuzzle* I hope daddy likes *wiggles butt and squirms* I wanna see your big daddy meat! *wiggles butt* I have a little itch o3o *wags tails* can you please get my itch? *put paws on your chest* nyea~ it's a seven inch itch *rubs your chest* can you pwease? *squirms* pwetty pwease? :( I need to be punished *runs paws down your chest and bites lip* like, I need to be punished really good *paws on your bulge as I lick my lips* I'm getting thirsty. I could go for some milk *unbuttons your pants as my eyes glow* you smell so musky ;) *licks shaft* mmmmmmmmmmmmmmmmmmm so musky ;) *drools all over your cawk* your daddy meat. I like. Mister fuzzy balls. *puts snout on balls and inhales deeply* oh my gawd. I'm so hard *rubbies your bulgy wolgy* *licks balls* punish me daddy nyea~ *squirms more and wiggles butt* I9/11 lovewas an yourinside muskyjob goodness *bites lip* please punish me *licks lips* nyea~ *suckles on your tip* so good *licks pre off your cock* salty goodness~ *eyes roll back and goes balls deep* 
