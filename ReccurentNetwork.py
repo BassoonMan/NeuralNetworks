@@ -11,6 +11,8 @@ import string
 
 import time
 
+from Misc.Loader import loadMatrix, loadWords
+
 @staticmethod
 def sigmoid(input): # untested
     #print(input)
@@ -98,21 +100,31 @@ class RecurrentNetwork:
             # for each training example...
             for sentence in self.trainingData:
                 length = len(sentence)
-                curSentence = []
-                for j in range(length - 1):
-                    curSentence.append(sentence[j])
-                    rawOutput = self.passThrough(curSentence)
-                    output = softmax(rawOutput)
+                rawOutput = self.passThrough(sentence)
+                output = softmax(rawOutput)
+                totalChangeHidden = np.zeros(self.hiddenWeights.shape)
+                totalChangeOutout = np.zeros(self.outputWeights.shape)
+                totalChangeInput = np.zeros(self.embeddingWeights.shape)
+                for j in reversed(range(length - 1)):
+                    target = np.zeros((self.wordCount, 1))
+                    target[self.wordIndex[sentence[j+1]]] = 1
 
-                    encoding = np.zeros((self.wordCount, 1))
-                    encoding[self.wordIndex[sentence[j+1]]] = 1
-
-                    diffs = np.subtract(encoding, output)
-                    changeInOutputWeight = np.dot(diffs, self.hiddenState.T)
-                    changeInHiddenWeight = np.zeros(())
-                    for k in range(j):
-                        pass
-                    #Implement Backpropagation through time
+                    diffs = np.subtract(target, output)
+                    changeOutput, changeHidden, changeInput = self.backpropagate(diffs, sentence, j+1)
+                    totalChangeOutout += changeOutput
+                    totalChangeHidden += changeHidden
+                    totalChangeInput += changeInput
+                if np.linalg.norm(totalChangeHidden, ord=2) > 3:
+                    totalChangeHidden = (3.0 / np.linalg.norm(totalChangeHidden, ord=2)) * totalChangeHidden
+                if np.linalg.norm(totalChangeOutout, ord=2) > 3:
+                    totalChangeOutout = (3.0 / np.linalg.norm(totalChangeOutout, ord=2)) * totalChangeOutout
+                if np.linalg.norm(totalChangeInput, ord=2) > 3:
+                    totalChangeInput = (3.0 / np.linalg.norm(totalChangeInput, ord=2)) * totalChangeInput
+                self.hiddenWeights += learning_rate * totalChangeHidden
+                self.outputWeights += learning_rate * totalChangeOutout
+                self.embeddingWeights += learning_rate * totalChangeInput
+        plt.plot(lossTrack)
+        plt.show()
 
     def calculateTotalLoss(self):
         L = 0
@@ -134,11 +146,9 @@ class RecurrentNetwork:
 
     def calculateLoss(self):
         # divide the total loss by the number of training examples
-        print(self.trainingData)
         N = np.sum((len(sentence) for sentence in self.trainingData))
         return self.calculateTotalLoss() / N
     
-
     def backpropagate(self, diffs, sentence, lengthOneMore):
         partialChangeInOutputWeight = np.dot(diffs, self.hiddenState.T)
         partialChangeInHiddenWeight = np.zeros(self.hiddenWeights.shape)
@@ -166,20 +176,43 @@ class RecurrentNetwork:
         self.hiddenState = np.tanh(np.atleast_2d(list(map(sigmoid ,np.dot(self.hiddenWeights, self.hiddenState) + np.dot(self.embeddingWeights, embeddedVector)))).T).T
         #TODO we have some kind of exploding size of the hidden state as the epochs go, not sure why
         self.hiddenStateRecord.append(self.hiddenState)
+    
+    def writeWeights(self):
+        with open("recurrentHiddenWeights.txt", "w") as txt_file:
+            for line in self.hiddenWeights:
+                txt_file.write(" ".join(map(str, line)) + "\n")
+            txt_file.close()
+        with open("recurrentEmbeddingWeights.txt", "w") as txt_file:
+            for line in self.embeddingWeights:
+                txt_file.write(" ".join(map(str, line)) + "\n")
+            txt_file.close()
+        with open("recurrentOutputWeights.txt", "w") as txt_file:
+            for line in self.outputWeights:
+                txt_file.write(" ".join(map(str, line)) + "\n")
+            txt_file.close()
 
-from Misc.Loader import loadMatrix, loadWords
+    def readWeights(self):
+        self.hiddenWeights = loadMatrix("recurrentHiddenWeights.txt")
+        self.embeddingWeights = loadMatrix("recurrentEmbeddingWeights.txt")
+        self.outputWeights = loadMatrix("recurrentOutputWeights.txt")
 
 if __name__ == '__main__':
-    matrix = np.atleast_2d(loadMatrix('wordEmbedding.txt')).T
+    embeddings = loadMatrix('wordEmbedding.txt')
+    matrix = np.atleast_2d(embeddings).T
     words = loadWords('vocab.txt')
     word2Index = {}
     for i in range(len(words)):
         word2Index[words[i].lower()] = i
-    net = RecurrentNetwork(4, 30, len(words), word2Index, matrix, words)
+    embeddingSize = len(embeddings[0])
+    net = RecurrentNetwork(embeddingSize, 30, len(words), word2Index, matrix, words)
     net.preprocess()
-    net.train(100)
+    if True:
+        net.train(100)
+    else:
+        net.readWeights()
+    net.writeWeights()
     generateSentenceLength = 10
-    sentence = "Dolly Parton's"
+    sentence = "cookies"
     i = 1
     while i <= generateSentenceLength:
         next = net.predictNext(sentence)

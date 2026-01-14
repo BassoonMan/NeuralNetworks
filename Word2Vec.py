@@ -129,7 +129,7 @@ class Word2Vec:
 
 if __name__ == "__main__":
     startTime = time.perf_counter()
-    model = Word2Vec(4, 2)
+    model = Word2Vec(5, 2)
     model.preprocess()
     model.train(100)
     endTime = time.perf_counter()
