@@ -135,7 +135,8 @@ class ArrayNetworkFeedforward:
         """
         with open("wordEmbedding.txt", "w") as txt_file:
             for line in self.weightsByLayer[0]:
-                txt_file.write(str(line.tolist()) + ",\n") # works with any number of elements in a line
+                # txt_file.write(str(line.tolist()) + ",\n") # works with any number of elements in a line
+                txt_file.write(" ".join(map(str, line)) + "\n")
             txt_file.close()
         return self.weightsByLayer[0]
 
