@@ -2,6 +2,9 @@ import numpy as np
 import random as rand
 from typing import List
 
+def soft_clip(x, limit=2.0):
+    return limit * np.tanh(x / limit)
+
 class ArrayNetworkFeedforward:
     """ 
     Class for a neural network implemented using arrays
@@ -32,17 +35,8 @@ class ArrayNetworkFeedforward:
     updateNetworkGeneralizedDelta(self, inputs, diffs, learnRate)
         Updates the network weights using gradient descent
     """
-    weightsByLayer = [] # Stored as (nextlayerDim X PreviousLayerDim)
-    layerLengths = []
-    layers = 0
-    biasByLayer = [] # Should be (1 X LayerDim)
-    outputsByLayerNonActivated = [] # Should always be stored as an array of (1 X layerDim)
-    outputsByLayerActivated = [] # Should always be stored as an array of (1 X layerDim)
-    bias = True
-    layerAct = [] # List of activation functions and their derivatives
-    
     #
-    def __init__(self, inputCount, layers, neuronPerLayer, layerAct, random = False, bias = True):
+    def __init__(self, inputCount, layers, neuronPerLayer, layerAct, random = False, isBias = True):
         """ Sets up the network, randomizing the initial weights
          
         Parameters:
@@ -58,7 +52,14 @@ class ArrayNetworkFeedforward:
             bias : bool
                 Switches between the network having a bias on each neuron or not (true or false)
         """
-        self.bias = bias
+        self.bias = isBias
+        self.weightsByLayer = [] # Stored as (nextlayerDim X PreviousLayerDim)
+        self.layerLengths = []
+        self.layers = 0
+        self.biasByLayer = [] # Should be (1 X LayerDim)
+        self.outputsByLayerNonActivated = [] # Should always be stored as an array of (1 X layerDim)
+        self.outputsByLayerActivated = [] # Should always be stored as an array of (1 X layerDim)
+        self.layerAct = [] # List of activation functions and their derivatives
         for i in range(layers):
             if (i == 0):
                 n = neuronPerLayer[0]
@@ -68,7 +69,7 @@ class ArrayNetworkFeedforward:
                 n = neuronPerLayer[i]
                 m = neuronPerLayer[i-1]
                 # Subsequent layers take previous layer length and point to next layer length
-            if (bias):
+            if (isBias):
                 bias = []
                 for j in range(neuronPerLayer[i]):
                     if (random):
@@ -88,8 +89,16 @@ class ArrayNetworkFeedforward:
         self.weightsByLayer.append(0)
         self.layers = layers
         self.layerAct = layerAct
+        self.weight_velocities = []
+        self.bias_velocities = []
+        for i in range(layers):
+            self.weight_velocities.append(np.zeros_like(self.weightsByLayer[i]) 
+                                        if isinstance(self.weightsByLayer[i], np.ndarray) 
+                                        else 0)
+            if isBias:
+                self.bias_velocities.append(np.zeros_like(self.biasByLayer[i]))
 
-    def evaluateNetwork(self, inputs:List[float]):
+    def evaluateNetwork(self, inputs:List[float], cached:bool=True) -> np.ndarray:
         """ Evaluates the network for a given input
          
         Parameters:
@@ -97,8 +106,9 @@ class ArrayNetworkFeedforward:
             inputs : array(float)
                 Vector of input values
         """
-        self.outputsByLayerActivated=[]
-        self.outputsByLayerNonActivated=[]
+        if (cached):
+            self.outputsByLayerActivated=[]
+            self.outputsByLayerNonActivated=[]
         if (inputs.shape[1] != self.weightsByLayer[0].shape[0]):
             print("evaluateNetwork: Wrong number of inputs!")
             print(str(inputs.shape[1]) + " Vs " + str(self.weightsByLayer[0].shape[0]))
@@ -115,10 +125,12 @@ class ArrayNetworkFeedforward:
             # Multiply the current vector by this layers weights, adding the bias if turned on
             # Apply the activation function
             act = np.vectorize(self.layerAct[i][0])
-            self.outputsByLayerNonActivated.append(temp)
+            if (cached):
+                self.outputsByLayerNonActivated.append(temp)
             temp = act(temp)
-            self.outputsByLayerActivated.append(temp)
-            # Append the outputs to the outputsByLayerNonActivated for use in backpropagation
+            if (cached):
+                self.outputsByLayerActivated.append(temp)
+                # Append the outputs to the outputsByLayerNonActivated for use in backpropagation
         return temp
     
     def printNetwork(self):
@@ -139,8 +151,33 @@ class ArrayNetworkFeedforward:
                 txt_file.write(" ".join(map(str, line)) + "\n")
             txt_file.close()
         return self.weightsByLayer[0]
+    
+    def backpropDelta(self, outerGrad, clip_limit=1.0):
+        """Propagate outer gradient to get dL/d(network_input).
+        outerGrad shape: (1, output_dim)
+        Returns shape: (1, input_dim)"""
+        
+        delta = outerGrad
+        for i in range(self.layers):
+            layer_idx = self.layers - 1 - i
+            
+            # Apply activation derivative at this layer
+            act_derivs = np.atleast_2d(list(map(
+                self.layerAct[layer_idx][1],
+                self.outputsByLayerNonActivated[layer_idx][0]
+            )))
+            delta = np.multiply(delta, act_derivs)
+            
+            # Propagate through this layer's weights
+            delta = np.matmul(delta, self.weightsByLayer[layer_idx].T)
 
-    def updateNetworkGeneralizedDelta(self, inputs, diffs, learnRate):
+            # Clip after each layer to prevent amplification cascade
+            if clip_limit > 0:
+                delta = soft_clip(delta, clip_limit)  # soft_clip instead of np.clip
+        
+        return delta
+
+    def updateNetworkGeneralizedDelta(self, inputs, diffs, learnRate, weightDecay = .001, momentum=0.9):
         """ Updates the network weights using gradient descent
          
         Parameters:
@@ -168,14 +205,9 @@ class ArrayNetworkFeedforward:
                 newDeltas = np.multiply(protoNewDeltas, list(map(self.layerAct[self.layers - 1 - i][1], outputs[0]))) #(1 X curLayerD)
             else:
                 newDeltas = np.multiply(diffs, list(map(self.layerAct[self.layers - 1 - i][1], outputs[0]))) #(1 X curLayerD)
-            # if (len(newDeltas) == 1 and len(newDeltas[0]) == 1):
-            # # Basically a test to see if we have a vector or just a single value
-            #     change = np.multiply(learnRate, np.multiply(np.transpose(newDeltas), currentInputs)) #(nextD X prevD)
-            # else:
-                #change = np.atleast_2d(np.multiply(learnRate, np.matmul(np.transpose(newDeltas), np.atleast_2d(currentInputs)))) 
-            change = np.multiply(learnRate, np.matmul(currentInputs.T, newDeltas)) #(curLayerD X prevLayerD)
+            change = np.matmul(currentInputs.T, newDeltas) #(curLayerD X prevLayerD)
                 # Change is the product of deltas and inputs times learning rate
-            changeBias = np.multiply(learnRate, newDeltas) # Bias is just product of learn rate and deltas # (1 X curLayerD)
+            changeBias = newDeltas # Bias is just product of learn rate and deltas # (1 X curLayerD)
             changeManifold.append(change)
             biasManifold.append(changeBias)
             # add both to the manifold
@@ -183,7 +215,42 @@ class ArrayNetworkFeedforward:
             # set up for next layer
         #print(changeManifold)
         for i in range(self.layers):
-        # This section just adds the changes to the weight and bias matricies
-            self.weightsByLayer[self.layers - i - 1] = np.add(self.weightsByLayer[self.layers - i - 1], changeManifold[i])
-            if self.bias:
-                self.biasByLayer[self.layers - i - 1] = np.add(self.biasByLayer[self.layers - i - 1], biasManifold[i])
+            idx = self.layers - i - 1
+            if isinstance(self.weightsByLayer[idx], np.ndarray):
+                if momentum > 0:
+                    self.weight_velocities[idx] = (momentum * self.weight_velocities[idx] + 
+                                                changeManifold[i])
+                    # print(learnRate)
+                    # print(self.weight_velocities[idx])
+                    effective_change = learnRate * self.weight_velocities[idx]
+                else:
+                    effective_change = learnRate * changeManifold[i]
+                
+                self.weightsByLayer[idx] = np.add(
+                    self.weightsByLayer[idx] * (1 - learnRate * weightDecay),
+                    effective_change
+                )
+                if self.bias:
+                    if momentum > 0:
+                        self.bias_velocities[idx] = (momentum * self.bias_velocities[idx] + 
+                                                    biasManifold[i])
+                        effective_bias_change = learnRate * self.bias_velocities[idx]
+                    else:
+                        effective_bias_change = learnRate * biasManifold[i]
+                    
+                    self.biasByLayer[idx] = np.add(
+                        self.biasByLayer[idx],
+                        effective_bias_change
+                    )
+
+    def computeJacobian(self, inputs):
+        """Compute d(output)/d(input) Jacobian matrix"""
+        self.evaluateNetwork(inputs, True)
+        # Start with identity
+        jacobian = np.eye(self.weightsByLayer[0].shape[0])
+        for i in range(self.layers):
+            # Derivative of activation
+            act_deriv = np.array(list(map(self.layerAct[i][1], self.outputsByLayerNonActivated[i][0])))
+            # Chain: J = diag(f') @ W @ J_prev
+            jacobian = np.diag(act_deriv) @ self.weightsByLayer[i].T @ jacobian
+        return jacobian

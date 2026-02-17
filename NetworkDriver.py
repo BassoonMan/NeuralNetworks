@@ -222,7 +222,7 @@ if __name__ == "__main__":
 
     endTime = time.perf_counter()
     print("end, time elapsed: ", endTime-startTime)
-    # plt.plot(errorTrack)
+    plt.plot(errorTrack)
     # plt.show()
     # networkB.printNetwork()
     # inputs = testSet3[1][0]

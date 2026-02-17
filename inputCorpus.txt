@@ -1,3 +1,30 @@
 Cookies for me are strictly for backend Identification, nothing sensitive, so only a unique identifier that is strictly used for login that changes every login, so it is more secure that way. Local storage is for remembering where your video volume bar was set so someone can keep that volume across the site, what sort someone wants for posts, whether light or dark mode is on, anything that Javascript can have control over, but isn't integral to the site's functionality.
 In my experience, cookies should be the default. More secure, and easier to clean up automatically. Abuse of localStorage means a ton of trash can be stuff into a user’s browser indefinitely. Not great stewardship of data persistence. 
 I put passwords in plain text local storage JavaScript website. 
+
+
+    # def compute_input_grads(self, diffs):
+    #     diffs_perm = diffs[:, self.perm]
+    #     diff1, diff2 = np.split(diffs_perm, 2, axis=1)
+        
+    #     x_perm = self.forward_x_perm
+    #     u1, u2 = np.split(x_perm, 2, axis=1)
+        
+    #     s1_raw = self.s1.evaluateNetwork(self.forward_v1, False)
+    #     s1_clipped = soft_clip(s1_raw, 2)
+    #     s1_clip_deriv = 1 - np.tanh(s1_raw / 2.0) ** 2
+        
+    #     s2_raw = self.s2.evaluateNetwork(u2, False)
+    #     s2_clipped = soft_clip(s2_raw, 2)
+        
+    #     # Compute full diff1 including indirect path
+    #     s1_outer = diff2 * u2 * np.exp(s1_clipped) * s1_clip_deriv
+    #     dL_dv1_via_s1 = self.s1.backpropDelta(s1_outer)
+    #     dL_dv1_via_t1 = self.t1.backpropDelta(diff2)
+    #     diff1_total = diff1 + dL_dv1_via_s1 + dL_dv1_via_t1
+        
+    #     du1 = diff1_total * np.exp(s2_clipped)
+    #     du2 = diff2 * np.exp(s1_clipped)
+        
+    #     input_diffs = np.concatenate((du1, du2), axis=1)
+    #     return input_diffs[:, np.argsort(self.perm)]
