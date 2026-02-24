@@ -1,0 +1,51 @@
+
+Perfect — here’s the minibatch timeline for your current code path (OpenCL backend enabled), with where data lives at each phase.
+
+One Minibatch Timeline (Current Implementation)
+Assume minibatch shape is (B, D).
+
+Build minibatch on host
+In INN.py, train_minibatch stacks samples:
+batch_inputs (host NumPy)
+batch_targets (host NumPy)
+Forward pass through coupling layers
+train_forward(batch_inputs) calls each AffCouplingLayer.train_forward.
+In each subnetwork call (s1/s2/t1/t2) inside ArrayNetwork.py:
+input is uploaded to device if OpenCL route is active,
+matmul/add/activation executed on device,
+cached tensors are kept device-side when cache_on_device=True.
+Output of evaluateNetwork is returned to host (to_host) at method return.
+Net effect: mostly device compute per subnetwork, with host handoff at boundaries.
+Compute minibatch diffs on host
+In INN.train_minibatch:
+diffs = (batch_targets - calc_outputs) / B
+This is host NumPy math.
+Backprop through coupling layers (reverse order)
+INN.backpropagate(diffs, ...) loops layers reversed.
+Inside each AffCouplingLayer.backpropagate:
+
+Phase 1 (delta building):
+Uses cached forward tensors.
+Calls s1.backpropDelta(...), t1.backpropDelta(...) etc.
+In ArrayNetwork.backpropDelta, delta propagation is mostly device-side now.
+Phase 2 (subnetwork updates):
+Calls updateNetworkGeneralizedDelta(...) for s1/t1/s2/t2.
+update_delta_propagation stays on device (your recent optimization).
+update_gradient_build still materializes delta/inputs to host and does NumPy matmul (faster at your current dimensions).
+update_weight_apply applies momentum/decay/update on host arrays and invalidates device parameter cache.
+Phase 3 (return input diffs):
+Host math in coupling layer combines terms and returns host diff.
+Next minibatch repeats
+Updated host weights trigger lazy re-upload (cache invalidation + next-use device upload).
+Where transfers happen most
+At boundaries where methods return host arrays (evaluateNetwork returns host).
+During gradient-build/update stage in updateNetworkGeneralizedDelta.
+At any to_host(...) needed for CPU-side stabilization and optimizer math.
+Why this still underutilizes compute
+Even after improvements:
+
+You still have mixed device/host stages within one training step.
+Work is split across many small subnetwork calls and per-layer phases.
+GPU does not see one long, fused compute chain; copy/sync overhead remains significant.
+If you want, I can next produce a “target-state timeline” (what to change so a minibatch stays device-resident until one final sync), mapped directly to your functions.
+

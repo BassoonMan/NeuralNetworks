@@ -1,0 +1,88 @@
+Absolutely. ArrayNetworkFeedforward in ArrayNetwork.py is the core dense subnetwork used by each coupling submodel (s1/s2/t1/t2).
+
+What it is
+
+It is a fully connected feedforward network with:
+    per-layer weight matrices
+    optional bias vectors
+    per-layer activation + derivative function pairs
+It supports two execution styles:
+    CPU/NumPy path
+    OpenCL path (with CLBlast-backed matmul in backend)
+It also has a mixed training strategy: some delta propagation stays on device, while parts of gradient/update still use host arrays when faster/stabler.
+Internal state layout
+
+weightsByLayer[i]: shape (prev_dim, cur_dim) for layer i.
+biasByLayer[i]: shape (1, cur_dim).
+outputsByLayerNonActivated[i]: cached pre-activation values (z) used by backprop.
+outputsByLayerActivated[i]: cached post-activation values (a) used by gradient build.
+Momentum buffers:
+    weight_velocities[i]
+    bias_velocities[i]
+Device caches:
+    _device_weight_cache
+    _device_weight_t_cache (transposes for backprop matmuls)
+    _device_bias_cache
+Forward pass (evaluateNetwork)
+
+Validates input width matches first layer input dim.
+Decides whether to run OpenCL based on:
+    backend choice
+    cached mode
+    cached OpenCL flags + min batch threshold
+For each layer:
+    computes affine transform: xW + b (or xW if no bias)
+    applies activation
+    optionally stores pre/post activation caches
+Returns host NumPy output (even if device path was used), so outer code has consistent type.
+Activation handling
+
+It pre-computes whether each activation/derivative supports ndarray fast path.
+For known activations, it asks backend for native device implementation.
+Otherwise it falls back to host elementwise callable application.
+Backprop input-gradient (backpropDelta)
+
+Purpose: compute ( \frac{\partial L}{\partial \text{network input}} ) from an outer gradient.
+Reverse-layer loop:
+    multiply by activation derivative at each layer cache
+    matmul by transposed layer weights
+    soft-clip to limit explosion
+OpenCL mode can run this on device; result is stabilized and returned as host array.
+Weight update (updateNetworkGeneralizedDelta)
+This is the most important routine, conceptually in 3 stages:
+
+Delta propagation
+Reconstructs per-layer newDeltas from output diffs backwards.
+Uses cached pre-activations + derivative.
+OpenCL path keeps this stage mostly device-resident now.
+Gradient build
+For each layer:
+    weight gradient: currentInputs.T @ newDeltas
+    bias gradient: newDeltas
+In your current tuned state, this is still host-built because device version regressed at current matrix sizes.
+Apply update
+Momentum blend:
+    velocity = momentum * velocity + grad
+Effective change:
+    learnRate * velocity (or plain grad if momentum disabled)
+Weight decay on weights
+Applies updates to weights/biases
+Invalidates device caches so next pass uploads fresh parameters.
+Numerical stabilization
+
+_stabilize_host_array(...) is used heavily to:
+replace NaN/Inf
+clip magnitude for gradients/updates/weights
+Separate guards:
+    _grad_clip_guard
+    _weight_clip_guard
+This is why training avoids intermittent NaN cascades after your recent changes.
+Profiling support
+
+Internal profiler tracks:
+backprop_delta_total (+ device/cpu split)
+update_delta_propagation
+update_gradient_build
+update_weight_apply
+This is what powers the per-epoch internal timing summaries you now see in INN.py.
+If you want, I can next walk line-by-line through one concrete minibatch iteration with actual tensor shapes (e.g., batch 128, dim 64, hidden 64) so each matrix multiply and cache entry is explicit.
