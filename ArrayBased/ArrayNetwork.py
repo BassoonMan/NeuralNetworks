@@ -369,8 +369,17 @@ class ArrayNetworkFeedforward:
     
     def backpropDelta(self, outerGrad, clip_limit=1.0):
         """Propagate outer gradient to get dL/d(network_input).
-        outerGrad shape: (1, output_dim)
-        Returns shape: (1, input_dim)"""
+        Parameters:
+        -----------
+            outerGrad : (1, output_dim)
+                This is the gradient coming into this layer from the layer after it.
+            clip_limit : float
+                If > 0, soft clip deltas after each layer to prevent amplification cascade.
+        Returns:
+        -----------
+            result : (1, input_dim)
+                This is the gradient with respect to the input of this network, which is then used to propagate to the previous layer.
+        """
         backprop_t0 = time.perf_counter() if self._internal_profiler_enabled else 0.0
 
         # Phase A: propagate outer gradient through this subnet to produce dL/dInput.
@@ -436,6 +445,10 @@ class ArrayNetworkFeedforward:
                 Vector corresponding to the difference between target and outputs, (1XD)
             learnRate : double
                 Proportionality constant for how much the change to the weights should be
+            weightDecay : double
+                Proportionality constant for how much the weights should be decayed by each update step
+            momentum : double
+                Momentum constant for how much of the previous update step's change should be applied in this step
         """
         update_t0 = time.perf_counter() if self._internal_profiler_enabled else 0.0
         # Phase B: parameter update using cached activations and output diffs.
@@ -443,9 +456,15 @@ class ArrayNetworkFeedforward:
         #   1) delta propagation
         #   2) gradient build
         #   3) weight/bias apply
-        inputs_host = self.backend.to_host(inputs)
+        #inputs_host = self.backend.to_host(inputs)
         device_update_path = self._use_device_backprop_math and self._use_opencl_backend
-        inputs_dev = self.backend.to_device(inputs_host, dtype=np.float32) if device_update_path else None
+        if device_update_path:
+            inputs_dev = self.backend.to_device(inputs)      # no-op if already on device
+            inputs_host = None
+        else:
+            inputs_host = self.backend.to_host(inputs)
+            inputs_dev = None
+        #inputs_dev = self.backend.to_device(inputs_host, dtype=np.float32) if device_update_path else None
         changeManifold = [] # Array of all the weight changes
         biasManifold = [] # Array of all the bias changes
         delta = None

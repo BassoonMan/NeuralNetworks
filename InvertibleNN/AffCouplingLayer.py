@@ -31,9 +31,19 @@ def identityDerivative(x):
 
 class AffCouplingLayer:
     def __init__(self, inputLength, internalLayers, internalLayerLength, backend="cpu"):
-        # Each coupling layer applies a learned permutation then splits channels
-        # into two halves (u1, u2). One half conditions transforms applied to the other.
-        # This structure is invertible by construction.
+        """ Initializes the Affine Layer
+        Parameters:
+        -----------
+            inputLength : int
+                This is the length of the input vector to the coupling layer. Must be even.
+            internalLayers : int
+                This is the number of layers in the s* and t* subnetworks.
+            internalLayerLength : int
+                This is the number of neurons in each internal layer of the s* and t* subnetworks.
+            backend : int
+                Determines if the code runs on GPU or CPU.
+        """
+        assert inputLength % 2 == 0, "Input length must be even for coupling layer."
         self.inputLength = inputLength
         self.perm = np.random.permutation(inputLength)
         networkInputLength = inputLength // 2
@@ -84,6 +94,14 @@ class AffCouplingLayer:
                     net.set_cached_opencl(True, min_batch=8, cache_on_device=True)
     
     def forward(self, x):
+        """ Passes an input through the network in the forward direction. Does not store any intermediate tensors, so this is suitable for inference but not training.
+        Parameters:
+        -----------
+            x : numpy.ndarray
+                Input into the coupling layer. Should have shape (batch_size, inputLength).
+        """
+        assert x.shape[1] == self.inputLength, f"Expected input with {self.inputLength} features, got {x.shape[1]}"
+        assert len(x.shape) == 2, f"Expected 2D input (batch_size, inputLength), got shape {x.shape}"
         # Inference forward (no training caches):
         # 1) permute and split
         # 2) v1 = u1 * exp(s2(u2)) + t2(u2)
