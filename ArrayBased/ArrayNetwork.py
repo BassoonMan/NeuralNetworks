@@ -519,7 +519,10 @@ class ArrayNetworkFeedforward:
                 currentInputs = self.backend.to_host(currentInputs_cached)
                 change = self._stabilize_host_array(np.matmul(currentInputs.T, newDeltas), clip_value=self._grad_clip_guard) #(curLayerD X prevLayerD)
             # Gradient tensors for this layer.
-            changeBias = self._stabilize_host_array(newDeltas, clip_value=self._grad_clip_guard) # Bias is just product of learn rate and deltas # (1 X curLayerD)
+            changeBias = self._stabilize_host_array(
+                np.sum(newDeltas, axis=0, keepdims=True), 
+                clip_value=self._grad_clip_guard
+            ) # Bias is just product of learn rate and deltas # (1 X curLayerD)
             if self._internal_profiler_enabled:
                 grad_stage_total += (time.perf_counter() - grad_stage_t0)
             changeManifold.append(change)

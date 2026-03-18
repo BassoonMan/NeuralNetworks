@@ -5,6 +5,10 @@ import random
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor
 import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from Misc.MNIST import MnistDataloader as Mnist
 
 class InvertibleNeuralNetwork:
     def __init__(self, layers, in_out_length, internalLayers=2, internalLayerLength=8, backend="cpu"):
@@ -258,8 +262,8 @@ class InvertibleNeuralNetwork:
 
 if __name__ == "__main__":
     testSet3 = []
-    backend = "opencl"
-    vector_size = 64
+    backend = "cpu"
+    vector_size = 28*28
     dataset_size = 2048
     internal_layers = 2
     hidden_width = 64
@@ -276,14 +280,19 @@ if __name__ == "__main__":
     inn.enable_step_profiler(True)
     inn.enable_internal_network_profiler(True)
 
+
+    imager = Mnist()
+    (x_train, y_train), (x_test, y_test) = imager.load_data()
+
+    # Mnist.show_images([x_train[1]], ['training image [' + str(1) + '] = ' + str(y_train[1])])
+
     test_input = testSet3[15][0]
     test_target = testSet3[15][1]
     # from gradient_check import numerical_gradient_check
     # numerical_gradient_check(inn, test_input, test_target)
 
-    # num = 100000
-    initial_lr = 0.002
-    min_lr = 0.00005
+    initial_lr = 0.0025
+    min_lr = 0.0001
     output_error_track = []
     startTime = time.perf_counter()
     learnRate = 0
@@ -294,6 +303,8 @@ if __name__ == "__main__":
     updates_per_epoch = (samples_per_epoch + batch_size - 1) // batch_size
     total_iterations = num_epochs * updates_per_epoch
     global_iteration = 0
+
+
 
     def reset_velocities(inn):
         for layer in inn.layers:
@@ -378,23 +389,60 @@ if __name__ == "__main__":
             break
 
     print(f"Time: {time.perf_counter() - startTime:.2f}s")
-    plt.plot(output_error_track)
-    plt.yscale('log')  # log scale shows convergence progress better
-    plt.xlabel('Epoch')
-    plt.ylabel('MSE')
-    plt.title('Training Error')
+    # plt.plot(output_error_track)
+    # plt.yscale('log')  # log scale shows convergence progress better
+    # plt.xlabel('Epoch')
+    # plt.ylabel('MSE')
+    # plt.title('Training Error')
+    # plt.show()
+    # x1 = testSet3[0][0]
+    # y1 = inn.forward(x1)
+    # x1_reconstructed = inn.backward(y1)
+    # print("Input:", x1)
+    # print("Output:", y1)
+    # print("Reconstructed Input:", x1_reconstructed)
+
+    # y2 = testSet3[0][1]
+    # x2 = inn.backward(y2)
+    # y2_reconstructed = inn.forward(x2)
+    # print("Input(backwards):", y2)
+    # print("Output(backwards):", x2)
+    # print("Reconstructed Input(backwards):", y2_reconstructed)
+    
+
+    image_vector = np.atleast_2d(np.array(x_train[0]).flatten().astype(np.float32))
+    
+    # Pass through INN forward
+    inn_output = inn.forward(image_vector)
+    #print(inn_output.shape)
+    
+    # Pass through INN backward (reconstruction)
+    reconstructed_vector = inn.backward(inn_output)
+    
+    # Reshape vectors back to 28x28 for display
+    original_img = image_vector.reshape(28, 28)
+    output_img = inn_output.reshape(28, 28)
+    reconstructed_img = reconstructed_vector.reshape(28, 28)
+    
+    # Plot original, INN output, and reconstruction side by side
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    
+    axes[0].imshow(original_img, cmap='gray')
+    axes[0].set_title(f'Original (label: {y_train[0]})')
+    axes[0].axis('off')
+    
+    axes[1].imshow(output_img, cmap='gray')
+    axes[1].set_title('INN Forward Output')
+    axes[1].axis('off')
+    
+    axes[2].imshow(reconstructed_img, cmap='gray')
+    axes[2].set_title('INN Reconstruction (backward)')
+    axes[2].axis('off')
+    
+    plt.suptitle('MNIST Image through Invertible Neural Network')
+    plt.tight_layout()
     plt.show()
-    x1 = testSet3[0][0]
-    y1 = inn.forward(x1)
-    x1_reconstructed = inn.backward(y1)
-    print("Input:", x1)
-    print("Output:", y1)
-    print("Reconstructed Input:", x1_reconstructed)
-
-    y2 = testSet3[0][1]
-    x2 = inn.backward(y2)
-    y2_reconstructed = inn.forward(x2)
-    print("Input(backwards):", y2)
-    print("Output(backwards):", x2)
-    print("Reconstructed Input(backwards):", y2_reconstructed)
-
+    
+    # Print reconstruction error
+    recon_error = np.mean((image_vector - reconstructed_vector) ** 2)
+    print(f"Reconstruction MSE: {recon_error:.8f}")
