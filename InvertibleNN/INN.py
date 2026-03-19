@@ -207,6 +207,7 @@ class InvertibleNeuralNetwork:
         calc_outputs = self.train_forward(batch_inputs)
         t1 = time.perf_counter() if self._profiler_enabled else 0.0
 
+        raw_diffs = batch_targets - calc_outputs
         diffs = (batch_targets - calc_outputs) / len(batch_samples)
 
         t2 = time.perf_counter() if self._profiler_enabled else 0.0
@@ -297,7 +298,7 @@ if __name__ == "__main__":
     startTime = time.perf_counter()
     learnRate = 0
 
-    num_epochs = 20
+    num_epochs = 10
     samples_per_epoch = len(testSet3)
     batch_size = min(128, samples_per_epoch)
     updates_per_epoch = (samples_per_epoch + batch_size - 1) // batch_size

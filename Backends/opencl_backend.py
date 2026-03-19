@@ -69,6 +69,173 @@ class OpenCLBackend:
     }
     """
 
+    _FUSED_SOURCE = r"""
+    __kernel void soft_clip_f32(
+        __global const float* X,
+        __global float* Y,
+        const float limit,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+        Y[i] = limit * tanh(X[i] / limit);
+    }
+
+    __kernel void sum_axis0_f32(
+        __global const float* X,
+        __global float* Y,
+        const int M,
+        const int N)
+    {
+        const int col = get_global_id(0);
+        if (col >= N) return;
+        float acc = 0.0f;
+        for (int row = 0; row < M; ++row) {
+            acc += X[row * N + col];
+        }
+        Y[col] = acc;
+    }
+
+    __kernel void matmul_at_b_f32(
+        __global const float* A,
+        __global const float* B,
+        __global float* C,
+        const int M,
+        const int N,
+        const int K)
+    {
+        // C[M, N] = A^T[M, K] @ B[K, N]
+        // A is stored as [K, M] (row-major), so A^T[m, k] = A[k * M + m]
+        const int row = get_global_id(0);
+        const int col = get_global_id(1);
+        if (row >= M || col >= N) return;
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            acc += A[k * M + row] * B[k * N + col];
+        }
+        C[row * N + col] = acc;
+    }
+
+    // Forward coupling: v = u * exp(soft_clip(s_raw, limit)) + t
+    __kernel void coupling_forward_f32(
+        __global const float* U,
+        __global const float* S_raw,
+        __global const float* T,
+        __global float* V,
+        const float limit,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+        float s_clipped = limit * tanh(S_raw[i] / limit);
+        V[i] = U[i] * exp(s_clipped) + T[i];
+    }
+
+    // Backward coupling: u = (v - t) * exp(-soft_clip(s_raw, limit))
+    __kernel void coupling_backward_f32(
+        __global const float* V,
+        __global const float* S_raw,
+        __global const float* T,
+        __global float* U,
+        const float limit,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+        float s_clipped = limit * tanh(S_raw[i] / limit);
+        U[i] = (V[i] - T[i]) * exp(-s_clipped);
+    }
+
+    // Outer gradient for s-network:
+    // outer = diff * u * exp(soft_clip(s_raw, limit)) * (1 - tanh(s_raw/limit)^2)
+    __kernel void coupling_s_outer_grad_f32(
+        __global const float* diff,
+        __global const float* U,
+        __global const float* S_raw,
+        __global float* outer,
+        const float limit,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+        float scaled = S_raw[i] / limit;
+        float th = tanh(scaled);
+        float s_clipped = limit * th;
+        float clip_deriv = 1.0f - th * th;
+        outer[i] = diff[i] * U[i] * exp(s_clipped) * clip_deriv;
+    }
+
+    // Input gradient: du = diff * exp(soft_clip(s_raw, limit))
+    __kernel void coupling_input_grad_f32(
+        __global const float* diff,
+        __global const float* S_raw,
+        __global float* du,
+        const float limit,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+        float s_clipped = limit * tanh(S_raw[i] / limit);
+        du[i] = diff[i] * exp(s_clipped);
+    }
+
+    // Fused soft_clip + optional clamp for gradient outer products:
+    // out = clamp(soft_clip(diff * u * exp(soft_clip(s_raw, s_limit)) * clip_deriv, out_limit), -guard, guard)
+    __kernel void coupling_s_outer_grad_clipped_f32(
+        __global const float* diff,
+        __global const float* U,
+        __global const float* S_raw,
+        __global float* outer,
+        const float s_limit,
+        const float out_limit,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+        float scaled = S_raw[i] / s_limit;
+        float th = tanh(scaled);
+        float s_clipped = s_limit * th;
+        float clip_deriv = 1.0f - th * th;
+        float val = diff[i] * U[i] * exp(s_clipped) * clip_deriv;
+        // Apply soft_clip to the output
+        outer[i] = out_limit * tanh(val / out_limit);
+    }
+
+    __kernel void leaky_relu_f32(
+        __global const float* X,
+        __global float* Y,
+        const float alpha,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+        const float x = X[i];
+        Y[i] = x >= 0.0f ? x : alpha * x;
+    }
+
+    __kernel void leaky_relu_deriv_f32(
+        __global const float* X,
+        __global float* Y,
+        const float alpha,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+        Y[i] = X[i] >= 0.0f ? 1.0f : alpha;
+    }
+
+    __kernel void tanh_deriv_f32(
+        __global const float* X,
+        __global float* Y,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+        float t = tanh(X[i]);
+        Y[i] = 1.0f - t * t;
+    }
+    """
+
     def __init__(self, preferred_device_type="gpu"):
         # Prefer GPU when available; fallback selection is handled in factory.
         if cl is None or cl_array is None:
@@ -98,9 +265,20 @@ class OpenCLBackend:
 
         self.context = cl.Context([selected_device])
         self.queue = cl.CommandQueue(self.context)
-        self._program = cl.Program(self.context, self._GEMM_SOURCE).build()
+        self._program = cl.Program(self.context, self._GEMM_SOURCE + self._FUSED_SOURCE).build()
         self._matmul_kernel = cl.Kernel(self._program, "matmul_f32")
         self._add_row_broadcast_kernel = cl.Kernel(self._program, "add_row_broadcast_f32")
+        self._soft_clip_kernel = cl.Kernel(self._program, "soft_clip_f32")
+        self._sum_axis0_kernel = cl.Kernel(self._program, "sum_axis0_f32")
+        self._matmul_at_b_kernel = cl.Kernel(self._program, "matmul_at_b_f32")
+        self._coupling_forward_kernel = cl.Kernel(self._program, "coupling_forward_f32")
+        self._coupling_backward_kernel = cl.Kernel(self._program, "coupling_backward_f32")
+        self._coupling_s_outer_kernel = cl.Kernel(self._program, "coupling_s_outer_grad_f32")
+        self._coupling_s_outer_clipped_kernel = cl.Kernel(self._program, "coupling_s_outer_grad_clipped_f32")
+        self._coupling_input_grad_kernel = cl.Kernel(self._program, "coupling_input_grad_f32")
+        self._leaky_relu_kernel = cl.Kernel(self._program, "leaky_relu_f32")
+        self._leaky_relu_deriv_kernel = cl.Kernel(self._program, "leaky_relu_deriv_f32")
+        self._tanh_deriv_kernel = cl.Kernel(self._program, "tanh_deriv_f32")
         self._has_pyclblast = pyclblast is not None
         # If CLBlast fails once on this runtime/device, disable and fallback to
         # custom kernel to avoid repeated exception overhead.
@@ -267,13 +445,128 @@ class OpenCLBackend:
             bd = self.to_device(b)
             return ad / bd
         return np.divide(a, b)
+    
+    def soft_clip(self, x, limit=2.0):
+        """Fused soft_clip: limit * tanh(x / limit) in a single kernel."""
+        xd = self.to_device(x, dtype=np.float32)
+        n = xd.size
+        out = cl_array.empty(self.queue, xd.shape, dtype=np.float32)
+        self._soft_clip_kernel(
+            self.queue, (int(n),), None,
+            xd.data, out.data, np.float32(limit), np.int32(n),
+        )
+        return out
+    
+    def sum(self, x, axis=None, keepdims=False):
+        if self.is_device_array(x):
+            if axis is None:
+                result = cl_array.sum(x)
+                if keepdims:
+                    # result is a scalar device array with shape (1,); reshape to match input ndim
+                    return result.reshape((1,) * x.ndim)
+                return result
+            if axis == 0 and len(x.shape) == 2:
+                m, n = x.shape
+                out = cl_array.empty(self.queue, (1, n) if keepdims else (n,), dtype=np.float32)
+                self._sum_axis0_kernel(
+                    self.queue, (int(n),), None,
+                    x.data, out.data, np.int32(m), np.int32(n),
+                )
+                return out
+            result = np.sum(x.get(), axis=axis, keepdims=keepdims)
+            return self.to_device(result, dtype=np.float32)
+        return np.sum(x, axis=axis, keepdims=keepdims)
+    
+    def matmul_at_b(self, a, b):
+        """Compute A^T @ B without materializing the transpose."""
+        ad = self.to_device(a, dtype=np.float32)
+        bd = self.to_device(b, dtype=np.float32)
+        # A is (K, M), A^T is (M, K), B is (K, N), result is (M, N)
+        k, m = ad.shape
+        k2, n = bd.shape
+        if k != k2:
+            raise ValueError(f"matmul_at_b shape mismatch: A ({k},{m}) B ({k2},{n})")
+        out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        self._matmul_at_b_kernel(
+            self.queue, (int(m), int(n)), None,
+            ad.data, bd.data, out.data,
+            np.int32(m), np.int32(n), np.int32(k),
+        )
+        return out
+    
+    def coupling_forward(self, u, s_raw, t, limit=2.0):
+        """v = u * exp(soft_clip(s_raw, limit)) + t — single kernel."""
+        ud = self.to_device(u, dtype=np.float32)
+        sd = self.to_device(s_raw, dtype=np.float32)
+        td = self.to_device(t, dtype=np.float32)
+        n = ud.size
+        out = cl_array.empty(self.queue, ud.shape, dtype=np.float32)
+        self._coupling_forward_kernel(
+            self.queue, (int(n),), None,
+            ud.data, sd.data, td.data, out.data,
+            np.float32(limit), np.int32(n),
+        )
+        return out
+
+    def coupling_backward(self, v, s_raw, t, limit=2.0):
+        """u = (v - t) * exp(-soft_clip(s_raw, limit)) — single kernel."""
+        vd = self.to_device(v, dtype=np.float32)
+        sd = self.to_device(s_raw, dtype=np.float32)
+        td = self.to_device(t, dtype=np.float32)
+        n = vd.size
+        out = cl_array.empty(self.queue, vd.shape, dtype=np.float32)
+        self._coupling_backward_kernel(
+            self.queue, (int(n),), None,
+            vd.data, sd.data, td.data, out.data,
+            np.float32(limit), np.int32(n),
+        )
+        return out
+
+    def coupling_s_outer_grad(self, diff, u, s_raw, s_limit=2.0, clip_limit=0.0):
+        """outer = diff * u * exp(soft_clip(s, s_limit)) * soft_clip_deriv(s, s_limit)
+        Optionally applies soft_clip(result, clip_limit) if clip_limit > 0."""
+        dd = self.to_device(diff, dtype=np.float32)
+        ud = self.to_device(u, dtype=np.float32)
+        sd = self.to_device(s_raw, dtype=np.float32)
+        n = dd.size
+        out = cl_array.empty(self.queue, dd.shape, dtype=np.float32)
+        if clip_limit > 0:
+            self._coupling_s_outer_clipped_kernel(
+                self.queue, (int(n),), None,
+                dd.data, ud.data, sd.data, out.data,
+                np.float32(s_limit), np.float32(clip_limit), np.int32(n),
+            )
+        else:
+            self._coupling_s_outer_kernel(
+                self.queue, (int(n),), None,
+                dd.data, ud.data, sd.data, out.data,
+                np.float32(s_limit), np.int32(n),
+            )
+        return out
+
+    def coupling_input_grad(self, diff, s_raw, limit=2.0):
+        """du = diff * exp(soft_clip(s_raw, limit)) — single kernel."""
+        dd = self.to_device(diff, dtype=np.float32)
+        sd = self.to_device(s_raw, dtype=np.float32)
+        n = dd.size
+        out = cl_array.empty(self.queue, dd.shape, dtype=np.float32)
+        self._coupling_input_grad_kernel(
+            self.queue, (int(n),), None,
+            dd.data, sd.data, out.data,
+            np.float32(limit), np.int32(n),
+        )
+        return out
 
     def apply_activation(self, x, func_name):
         xd = self.to_device(x)
         if func_name == "leakyReLU":
-            alpha = 0.01
-            # Branchless leaky ReLU: 0.5 * ((1+alpha)x + (1-alpha)|x|)
-            return 0.5 * ((1.0 + alpha) * xd + (1.0 - alpha) * clmath.fabs(xd))
+            n = xd.size
+            out = cl_array.empty(self.queue, xd.shape, dtype=np.float32)
+            self._leaky_relu_kernel(
+                self.queue, (int(n),), None,
+                xd.data, out.data, np.float32(0.01), np.int32(n),
+            )
+            return out
         if func_name == "tanh":
             return clmath.tanh(xd)
         if func_name == "identity":
@@ -283,13 +576,23 @@ class OpenCLBackend:
     def apply_activation_derivative(self, x, func_name):
         xd = self.to_device(x)
         if func_name == "leakyReLU":
-            alpha = 0.01
-            eps = 1e-6
-            sign_x = xd / (clmath.fabs(xd) + eps)
-            return 0.5 * ((1.0 + alpha) + (1.0 - alpha) * sign_x)
+            n = xd.size
+            out = cl_array.empty(self.queue, xd.shape, dtype=np.float32)
+            self._leaky_relu_deriv_kernel(
+                self.queue, (int(n),), None,
+                xd.data, out.data, np.float32(0.01), np.int32(n),
+            )
+            return out
         if func_name == "tanh":
-            t = clmath.tanh(xd)
-            return 1.0 - t * t
+            n = xd.size
+            out = cl_array.empty(self.queue, xd.shape, dtype=np.float32)
+            self._tanh_deriv_kernel(
+                self.queue, (int(n),), None,
+                xd.data, out.data, np.int32(n),
+            )
+            return out
         if func_name == "identity":
-            return xd * 0.0 + 1.0
+            out = cl_array.empty(self.queue, xd.shape, dtype=np.float32)
+            out.fill(np.float32(1.0))
+            return out
         return None
