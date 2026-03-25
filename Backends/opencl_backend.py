@@ -234,6 +234,225 @@ class OpenCLBackend:
         float t = tanh(X[i]);
         Y[i] = 1.0f - t * t;
     }
+    // Fused bias-add + activation in a single pass.
+    // Y[row, col] = activation(X[row, col] + B[col])
+    // act_type: 0 = identity, 1 = leakyReLU (alpha=0.01), 2 = tanh
+    __kernel void fused_bias_act_f32(
+        __global const float* X,       // (M, N) matmul output
+        __global const float* B,       // (1, N) bias row
+        __global float* Y,             // (M, N) output
+        const int M,
+        const int N,
+        const int act_type)
+    {
+        const int row = get_global_id(0);
+        const int col = get_global_id(1);
+        if (row >= M || col >= N) return;
+
+        float val = X[row * N + col] + B[col];
+
+        // Apply activation in-place
+        if (act_type == 1) {          // leakyReLU
+            val = val >= 0.0f ? val : 0.01f * val;
+        } else if (act_type == 2) {   // tanh
+            val = tanh(val);
+        }
+        // act_type == 0: identity (no-op)
+
+        Y[row * N + col] = val;
+    }
+    // Fused SGD + momentum + weight decay update.
+    // velocity_new = momentum * velocity + gradient
+    // w_new = w * (1 - lr * wd) + lr * velocity_new
+    __kernel void fused_sgd_momentum_f32(
+        __global float* W,             // weights (read/write)
+        __global float* V,             // velocity (read/write)
+        __global const float* G,       // gradient
+        const float lr,
+        const float momentum,
+        const float decay_factor,      // pre-computed: 1.0 - lr * wd
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+
+        float v = momentum * V[i] + G[i];
+        V[i] = v;
+        W[i] = decay_factor * W[i] + lr * v;
+    }
+
+    // Same for bias (no weight decay typically, but you can add it)
+    __kernel void fused_sgd_momentum_bias_f32(
+        __global float* B,
+        __global float* V,
+        __global const float* G,
+        const float lr,
+        const float momentum,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+
+        float v = momentum * V[i] + G[i];
+        V[i] = v;
+        B[i] = B[i] + lr * v;
+    }
+    // C[M, N] = soft_clip(A^T[M, K] @ B[K, N], limit)
+    // A stored as [K, M], so A^T[m, k] = A[k*M + m]
+    __kernel void matmul_at_b_clip_f32(
+        __global const float* A,
+        __global const float* B,
+        __global float* C,
+        const int M,
+        const int N,
+        const int K,
+        const float clip_limit)
+    {
+        const int row = get_global_id(0);
+        const int col = get_global_id(1);
+        if (row >= M || col >= N) return;
+
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            acc += A[k * M + row] * B[k * N + col];
+        }
+
+        // Fuse soft_clip into the store
+        if (clip_limit > 0.0f) {
+            acc = clip_limit * tanh(acc / clip_limit);
+        }
+        C[row * N + col] = acc;
+    }
+    __kernel void sum_axis0_clip_f32(
+    __global const float* X,
+    __global float* Y,
+    const int M,
+    const int N,
+    const float clip_limit)
+    {
+        const int col = get_global_id(0);
+        if (col >= N) return;
+
+        float acc = 0.0f;
+        for (int row = 0; row < M; ++row) {
+            acc += X[row * N + col];
+        }
+
+        if (clip_limit > 0.0f) {
+            acc = clip_limit * tanh(acc / clip_limit);
+        }
+        Y[col] = acc;
+    }
+    // delta_out = soft_clip(input_delta * act_deriv(preact), clip_limit)
+    // act_type: 0 = identity, 1 = leakyReLU, 2 = tanh
+    __kernel void fused_delta_act_clip_f32(
+        __global const float* input_delta,  // (M, N) — proto deltas or diffs
+        __global const float* preact,       // (M, N) — pre-activation cache
+        __global float* output_delta,       // (M, N) — result
+        const int act_type,
+        const float clip_limit,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+
+        // Compute activation derivative inline
+        float d;
+        if (act_type == 1) {           // leakyReLU derivative
+            d = preact[i] >= 0.0f ? 1.0f : 0.01f;
+        } else if (act_type == 2) {    // tanh derivative
+            float t = tanh(preact[i]);
+            d = 1.0f - t * t;
+        } else {                       // identity derivative
+            d = 1.0f;
+        }
+
+        float val = input_delta[i] * d;
+
+        // Fuse soft_clip
+        if (clip_limit > 0.0f) {
+            val = clip_limit * tanh(val / clip_limit);
+        }
+
+        output_delta[i] = val;
+    }
+    // out = soft_clip(A + B + C, limit)
+    __kernel void add3_clip_f32(   
+        __global const float* A, __global const float* B, __global const float* C,
+        __global float* out, const float clip_limit, const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+
+        float val = A[i] + B[i] + C[i];
+
+        if (clip_limit > 0.0f) {
+            val = clip_limit * tanh(val / clip_limit);
+        }
+
+        out[i] = val;
+    }
+    // Reads x[row, perm[col]], writes to u1/u2 based on whether col < half
+    __kernel void permute_split_f32(
+    __global const float* X, __global const int* perm,
+    __global float* U1, __global float* U2,
+    const int M, const int full_N, const int half_N)
+    {
+        const int row = get_global_id(0);
+        const int col = get_global_id(1);
+        if (row >= M || col >= full_N) return;
+        float val = X[row * full_N + perm[col]];
+        if (col < half_N) {
+            U1[row * half_N + col] = val;
+        } else {
+            U2[row * half_N + (col - half_N)] = val;
+        }
+    }
+    // out[row, inv_perm[col]] = left_or_right_half[row, col]
+    __kernel void concat_invperm_f32(
+        __global const float* U1, __global const float* U2,
+        __global const int* inv_perm, __global float* out,
+        const int M, const int half_N)
+    {
+        const int row = get_global_id(0);
+        const int col = get_global_id(1);
+        if (row >= M || col >= 2 * half_N) return;
+        int src_col = inv_perm[col];
+        float val;
+        if (src_col < half_N) {
+            val = U1[row * half_N + src_col];
+        } else {
+            val = U2[row * half_N + (src_col - half_N)];
+        }
+        out[row * (2 * half_N) + col] = val;
+    }
+    // One kernel, two outputs:
+    //   pre_act[row, col] = X[row, col] + B[col]
+    //   post_act[row, col] = activation(X[row, col] + B[col])
+    __kernel void fused_bias_act_dual_f32(
+        __global const float* X,        // (M, N) matmul result
+        __global const float* B,        // (1, N) bias
+        __global float* pre_act,        // (M, N) output: X + B
+        __global float* post_act,       // (M, N) output: activation(X + B)
+        const int M,
+        const int N,
+        const int act_type)             // 0=identity, 1=leakyReLU, 2=tanh
+    {
+        const int row = get_global_id(0);
+        const int col = get_global_id(1);
+        if (row >= M || col >= N) return;
+
+        float val = X[row * N + col] + B[col];
+        pre_act[row * N + col] = val;       // cache for backprop
+
+        if (act_type == 1) {
+            val = val >= 0.0f ? val : 0.01f * val;
+        } else if (act_type == 2) {
+            val = tanh(val);
+        }
+
+        post_act[row * N + col] = val;      // activated output
+    }
     """
 
     def __init__(self, preferred_device_type="gpu"):
@@ -279,12 +498,21 @@ class OpenCLBackend:
         self._leaky_relu_kernel = cl.Kernel(self._program, "leaky_relu_f32")
         self._leaky_relu_deriv_kernel = cl.Kernel(self._program, "leaky_relu_deriv_f32")
         self._tanh_deriv_kernel = cl.Kernel(self._program, "tanh_deriv_f32")
+        self._fused_bias_act_kernel = cl.Kernel(self._program, "fused_bias_act_f32")
+        self._fused_sgd_kernel = cl.Kernel(self._program, "fused_sgd_momentum_f32")
+        self._fused_sgd_bias_kernel = cl.Kernel(self._program, "fused_sgd_momentum_bias_f32")
+        self._fused_matmul_at_b_clip_kernel = cl.Kernel(self._program, "matmul_at_b_clip_f32")
+        self._fused_sum_axis0_clip_kernel = cl.Kernel(self._program, "sum_axis0_clip_f32")
+        self._permute_split_kernel = cl.Kernel(self._program, "permute_split_f32")
+        self._add3_clip_kernel = cl.Kernel(self._program, "add3_clip_f32")
+        self._fused_delta_act_clip_kernel = cl.Kernel(self._program, "fused_delta_act_clip_f32")
+        self._concat_invperm_kernel = cl.Kernel(self._program, "concat_invperm_f32")
+        self._fused_bias_act_dual_kernel = cl.Kernel(self._program, "fused_bias_act_dual_f32")
         self._has_pyclblast = pyclblast is not None
         # If CLBlast fails once on this runtime/device, disable and fallback to
         # custom kernel to avoid repeated exception overhead.
         self._disable_pyclblast = False
         self._force_kernel_matmul = False
-
     def set_matmul_engine(self, engine="auto"):
         # auto    -> prefer CLBlast then fallback kernel
         # clblast -> force CLBlast usage (raises if unavailable)
@@ -603,3 +831,127 @@ class OpenCLBackend:
             x_h = x.get()
             return cl_array.to_device(self.queue, np.ascontiguousarray(x_h.T))
         return np.ascontiguousarray(np.asarray(x).T)
+
+    def fused_bias_act(self, x, bias, act_type):
+        """Fused bias-add + activation: activation(X + B) in one kernel."""
+        xd = self.to_device(x, dtype=np.float32)
+        bd = self.to_device(bias, dtype=np.float32)
+        m, n = xd.shape
+        out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        if act_type < 0:
+            return None  # unsupported — caller falls back
+        self._fused_bias_act_kernel(
+            self.queue, (int(m), int(n)), None,
+            xd.data, bd.data, out.data,
+            np.int32(m), np.int32(n), np.int32(act_type),
+        )
+        return out
+    
+    def fused_sgd_update(self, weights, velocity, gradient, lr, momentum, decay_factor):
+        """In`-place: v = mom*v + g; w = decay*w + lr*v"""
+        n = weights.size
+        self._fused_sgd_kernel(
+            self.queue, (int(n),), None,
+            weights.data, velocity.data, gradient.data,
+            np.float32(lr), np.float32(momentum), np.float32(decay_factor),
+            np.int32(n),
+        )
+
+    def fused_sgd_bias_update(self, bias, velocity, gradient, lr, momentum):
+        """In-place: v = mom*v + g; b = b + lr*v"""
+        n = bias.size
+        self._fused_sgd_bias_kernel(
+            self.queue, (int(n),), None,
+            bias.data, velocity.data, gradient.data,
+            np.float32(lr), np.float32(momentum),
+            np.int32(n),
+        )
+
+    def matmul_at_b_clip(self, a, b, clip):
+        """Compute clip(A^T @ B) without materializing the transpose."""
+        ad = self.to_device(a, dtype=np.float32)
+        bd = self.to_device(b, dtype=np.float32)
+        # A is (K, M), A^T is (M, K), B is (K, N), result is (M, N)
+        k, m = ad.shape
+        k2, n = bd.shape
+        if k != k2:
+            raise ValueError(f"matmul_at_b shape mismatch: A ({k},{m}) B ({k2},{n})")
+        out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        self._fused_matmul_at_b_clip_kernel(
+            self.queue, (int(m), int(n)), None,
+            ad.data, bd.data, out.data,
+            np.int32(m), np.int32(n), np.int32(k), np.float32(clip),
+        )
+        return out
+
+    def sum_axis0_clip(self, x, clip):
+        """Compute sum along axis 0 with clipping."""
+        m, n = x.shape
+        out = cl_array.empty(self.queue, (1, n), dtype=np.float32)
+        self._fused_sum_axis0_clip_kernel(
+            self.queue, (int(n),), None,
+            x.data, out.data,
+            np.int32(m), np.int32(n), np.float32(clip),
+        )
+        return out
+    
+    def delta_act_clip(self, inputs, outputs, act_type, clip):
+        """Compute input_delta * act_deriv(preact) with optional clipping in one kernel.
+        inputs: pre-activation values (for computing act_deriv)"""
+        m, n = inputs.shape
+        out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        self._fused_delta_act_clip_kernel(
+            self.queue, (int(n*m),), None,
+            inputs.data, outputs.data, out.data, np.int32(act_type), np.float32(clip), np.int32(n*m),
+        )
+        return out
+    
+    def add3_clip(self, A, B, C, clip):
+        """Compute sum along axis 0 with clipping."""
+        m, n = A.shape
+        out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        self._add3_clip_kernel(
+            self.queue, (int(n*m),), None,
+            A.data, B.data, C.data, out.data, np.float32(clip), np.int32(n*m),
+        )
+        return out
+
+    def permute_split(self, x, perm):
+        """Permutes and splits the input array."""
+        x = self.to_device(x, dtype=np.float32)
+        m, n = x.shape
+        perm_dev = self.to_device(perm, dtype=np.int32)
+        out1 = cl_array.empty(self.queue, (m, n//2), dtype=np.float32)
+        out2 = cl_array.empty(self.queue, (m, n//2), dtype=np.float32)
+        self._permute_split_kernel(
+            self.queue, (int(m), int(n)), None,
+            x.data, perm_dev.data, out1.data, out2.data, np.int32(m), np.int32(n), np.int32(n//2),
+        )
+        return out1, out2
+    
+    def concat_invperm(self, x1, x2, inv_perm):
+        """Concatenates and applies inverse permutation to the input arrays."""
+        x1 = self.to_device(x1, dtype=np.float32)
+        x2 = self.to_device(x2, dtype=np.float32)
+        m, n = x1.shape
+        perm_dev = self.to_device(inv_perm, dtype=np.int32)
+        out = cl_array.empty(self.queue, (m, 2*n), dtype=np.float32)
+        self._concat_invperm_kernel(
+            self.queue, (int(m), int(2*n)), None,
+            x1.data, x2.data, perm_dev.data, out.data, np.int32(m), np.int32(n),
+        )
+        return out
+
+    def bias_act_dual(self, x, bias, act_type):
+        """Applies bias and activation function while saving the results before and after activation."""
+        x = self.to_device(x, dtype=np.float32)
+        bias = self.to_device(bias, dtype=np.float32)
+        m, n = x.shape
+        out1 = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        out2 = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        # print(f"Launching fused_bias_act_dual kernel with M={m}, N={n}, act_type={act_type}, x_ptr={x.data}, bias_ptr={bias.data}, out1_ptr={out1.data}, out2_ptr={out2.data}")
+        self._fused_bias_act_dual_kernel(
+            self.queue, (int(m), int(n)), None,
+            x.data, bias.data, out1.data, out2.data, np.int32(m), np.int32(n), np.int32(act_type),
+        )
+        return out1, out2

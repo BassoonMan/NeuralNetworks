@@ -263,7 +263,7 @@ class InvertibleNeuralNetwork:
 
 if __name__ == "__main__":
     testSet3 = []
-    backend = "cpu"
+    backend = "cpu"  # "cpu" or "opencl"
     vector_size = 28*28
     dataset_size = 2048
     internal_layers = 2

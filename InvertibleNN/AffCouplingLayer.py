@@ -49,6 +49,9 @@ class AffCouplingLayer:
         networkInputLength = inputLength // 2
         self.backend = get_backend(backend)
         self._use_device = str(backend).lower() in ("opencl", "gpu", "amd")
+        if self._use_device:
+            self._perm_dev = self.backend.to_device(self.perm, dtype=np.int32)
+            self._inv_perm_dev = self.backend.to_device(self._inv_perm, dtype=np.int32)
         # s* networks produce scale-like terms; tanh bounded outputs improve stability.
         self.s1 = ArrayNetwork(
             networkInputLength,
@@ -139,10 +142,12 @@ class AffCouplingLayer:
         assert len(x.shape) == 2, f"Expected 2D input (batch_size, inputLength), got shape {x.shape}"
         # Same transform as forward(), but stores intermediate tensors used by backprop.
         self.forward_input = x
-        x_perm = x[:, self.perm] # Randomly permute x
-        u1, u2 = np.split(x_perm, 2, axis=1) # split into two parts
-        u1 = self._to_dev(u1)
-        u2 = self._to_dev(u2)
+        x_dev = self._to_dev(x)
+        u1, u2 = self.backend.permute_split(x_dev, self._perm_dev)
+        # x_perm = x[:, self.perm] # Randomly permute x
+        # u1, u2 = np.split(x_perm, 2, axis=1) # split into two parts
+        # u1 = self._to_dev(u1)
+        # u2 = self._to_dev(u2)
         s2_raw = self.s2.evaluateNetwork(u2, False)
         t2_raw = self.t2.evaluateNetwork(u2, False)
         v1 = self.backend.coupling_forward(u1, s2_raw, t2_raw, 2.0)
@@ -151,18 +156,21 @@ class AffCouplingLayer:
         t1_raw = self.t1.evaluateNetwork(v1, False)
         v2 = self.backend.coupling_forward(u2, s1_raw, t1_raw, 2.0)
          # Calculate the second output
-        v1 = self._to_host(v1)
-        v2 = self._to_host(v2)
-        output = np.concatenate((v1, v2), axis=1) # Fuse back together
-        return output[:, self._inv_perm]
+        return self._to_host(self.backend.concat_invperm(v1, v2, self._inv_perm_dev))
+        # v1 = self._to_host(v1)
+        # v2 = self._to_host(v2)
+        # output = np.concatenate((v1, v2), axis=1) # Fuse back together
+        # return output[:, self._inv_perm]
     
     def train_forward(self, x):
         # Same transform as forward(), but stores intermediate tensors used by backprop.
         self.forward_input = x
-        x_perm = x[:, self.perm] # Randomly permute x
-        u1, u2 = np.split(x_perm, 2, axis=1) # split into two parts
-        u1 = self._to_dev(u1)
-        u2 = self._to_dev(u2)
+        x_dev = self._to_dev(x)
+        u1, u2 = self.backend.permute_split(x_dev, self._perm_dev)
+        # x_perm = x[:, self.perm] # Randomly permute x
+        # u1, u2 = np.split(x_perm, 2, axis=1) # split into two parts
+        # u1 = self._to_dev(u1)
+        # u2 = self._to_dev(u2)
         s2_raw = self.s2.evaluateNetwork(u2)
         t2_raw = self.t2.evaluateNetwork(u2)
         v1 = self.backend.coupling_forward(u1, s2_raw, t2_raw, 2.0)
@@ -175,16 +183,19 @@ class AffCouplingLayer:
         v2 = self._to_host(v2)
         self.forward_v1 = v1
         self.forward_v2 = v2
-        output = np.concatenate((v1, v2), axis=1) # Fuse back together
-        return output[:, self._inv_perm]
+        return self._to_host(self.backend.concat_invperm(v1, v2, self._inv_perm_dev))
+        # output = np.concatenate((v1, v2), axis=1) # Fuse back together
+        # return output[:, self._inv_perm]
 
     def backward(self, y):
         # Exact inverse of forward().
         # Because affine coupling equations are triangular, inversion is closed-form.
-        y = y[:, self.perm]
-        v1, v2 = np.split(y, 2, axis=1) # Split
-        v1 = self._to_dev(v1)
-        v2 = self._to_dev(v2)
+        y_dev = self._to_dev(y)
+        v1, v2 = self.backend.permute_split(y_dev, self._perm_dev)
+        # y = y[:, self.perm]
+        # v1, v2 = np.split(y, 2, axis=1) # Split
+        # v1 = self._to_dev(v1)
+        # v2 = self._to_dev(v2)
         s1_raw = self.s1.evaluateNetwork(v1, False)
         t1_raw = self.t1.evaluateNetwork(v1, False)
         u2 = self.backend.coupling_backward(v2, s1_raw, t1_raw, 2.0)
@@ -192,15 +203,18 @@ class AffCouplingLayer:
         s2_raw = self.s2.evaluateNetwork(u2, False)
         t2_raw = self.t2.evaluateNetwork(u2, False)
         u1 = self.backend.coupling_backward(v1, s2_raw, t2_raw, 2.0)
-        u1 = self._to_host(u1)
-        u2 = self._to_host(u2)
-        x = np.concatenate((u1, u2), axis=1) # Fuse back together
-        return x[:, self._inv_perm] # Invert the permutation from forward
+        return self._to_host(self.backend.concat_invperm(u1, u2, self._inv_perm_dev))
+        # u1 = self._to_host(u1)
+        # u2 = self._to_host(u2)
+        # x = np.concatenate((u1, u2), axis=1) # Fuse back together
+        # return x[:, self._inv_perm] # Invert the permutation from forward
 
     def train_backward(self, y):
         # Cached inverse path used by frontpropagate variant.
-        y = y[:, self.perm]
-        v1, v2 = np.split(y, 2, axis=1) # Split
+        y_dev = self._to_dev(y)
+        v1, v2 = self.backend.permute_split(y_dev, self._perm_dev)
+        # y = y[:, self.perm]
+        # v1, v2 = np.split(y, 2, axis=1) # Split
         s1_raw = self.s1.evaluateNetwork(v1)
         t1_raw = self.t1.evaluateNetwork(v1)
         u2 = self.backend.coupling_backward(v2, s1_raw, t1_raw, 2.0)
@@ -222,13 +236,14 @@ class AffCouplingLayer:
         # I have an assumption that x and diffs are on the host, at least for now.
 
         # Permute and split — avoid bouncing between host/device by just keeping on host until end.
-        # x_dev = self._to_dev(x)
-        x_perm = x[:, self.perm]
-        # x_perm = self._permute_cols(x_dev, self.perm)
-        u1_h, u2_h = np.split(x_perm, 2, axis=1)
-        # u1, u2 = self._split_dev(x_perm)
-        u1 = self._to_dev(u1_h)
-        u2 = self._to_dev(u2_h)
+        x_dev = self._to_dev(x)
+        u1, u2 = self.backend.permute_split(x_dev, self.perm)
+        # x_perm = x[:, self.perm]
+        # # x_perm = self._permute_cols(x_dev, self.perm)
+        # u1_h, u2_h = np.split(x_perm, 2, axis=1)
+        # # u1, u2 = self._split_dev(x_perm)
+        # u1 = self._to_dev(u1_h)
+        # u2 = self._to_dev(u2_h)
 
         # diffs_dev = self._to_dev(diffs)
         diffs_perm = diffs[:, self.perm]
@@ -252,9 +267,7 @@ class AffCouplingLayer:
         dL_dv1_via_s1 = self.s1.backpropDelta(s1_outer, clip_limit)
         dL_dv1_via_t1 = self.t1.backpropDelta(diff2, clip_limit)
 
-        diff1_total = self._add(self._add(diff1, dL_dv1_via_s1), dL_dv1_via_t1)
-        if clip:
-            diff1_total = self._soft_clip_dev(diff1_total, 1)
+        diff1_total = self.backend.add3_clip(diff1, dL_dv1_via_s1, dL_dv1_via_t1, clip=1.0)
 
         # s2 values
         s2_raw = self.s2.evaluateNetwork(u2, True)
