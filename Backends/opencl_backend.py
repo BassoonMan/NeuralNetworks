@@ -596,3 +596,10 @@ class OpenCLBackend:
             out.fill(np.float32(1.0))
             return out
         return None
+
+    def transpose(self, x):
+        """Return a contiguous transposed copy on device."""
+        if self.is_device_array(x):
+            x_h = x.get()
+            return cl_array.to_device(self.queue, np.ascontiguousarray(x_h.T))
+        return np.ascontiguousarray(np.asarray(x).T)

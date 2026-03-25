@@ -75,3 +75,7 @@ class NumpyBackend:
         if func_name == "identity":
             return np.ones_like(x, dtype=np.float32)
         return None
+
+    def transpose(self, x):
+        """Return transposed array."""
+        return np.ascontiguousarray(np.asarray(x).T)

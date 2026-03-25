@@ -80,7 +80,12 @@ class ArrayNetworkFeedforward:
         # Numeric guardrails used to avoid exploding updates / NaN cascades.
         self._grad_clip_guard = 5.0
         self._weight_clip_guard = 10.0
-        # Device-side parameter caches to avoid repeated host->device copies.
+        # This eliminates host<->device round-trips during updates.
+        self._device_resident_weights = self._use_opencl_backend
+        # Device-side parameter caches (transposed weights for backprop).
+        # When _device_resident_weights is True, _device_weight_cache is not needed
+        # since weightsByLayer already holds device arrays. Only the transpose cache
+        # is maintained.
         self._device_weight_cache = {}
         self._device_weight_t_cache = {}
         self._device_bias_cache = {}
@@ -151,6 +156,47 @@ class ArrayNetworkFeedforward:
             self._act_fast.append(self._is_array_compatible(self.layerAct[i][0], probe))
             self._act_deriv_fast.append(self._is_array_compatible(self.layerAct[i][1], probe))
 
+        # Upload weights, biases, and velocities to device if using GPU backend.
+        if self._device_resident_weights:
+            self._upload_all_params_to_device()
+
+
+    def _upload_all_params_to_device(self):
+        """Move all weight/bias/velocity arrays to device. Called once at init
+        and can be called again if params are replaced from host."""
+        for i in range(self.layers):
+            w = self.weightsByLayer[i]
+            if isinstance(w, np.ndarray):
+                self.weightsByLayer[i] = self.backend.to_device(w, dtype=np.float32)
+            v = self.weight_velocities[i]
+            if isinstance(v, np.ndarray):
+                self.weight_velocities[i] = self.backend.to_device(v, dtype=np.float32)
+            if self.bias:
+                b = self.biasByLayer[i]
+                if isinstance(b, np.ndarray):
+                    self.biasByLayer[i] = self.backend.to_device(b, dtype=np.float32)
+                bv = self.bias_velocities[i]
+                if isinstance(bv, np.ndarray):
+                    self.bias_velocities[i] = self.backend.to_device(bv, dtype=np.float32)
+        # Rebuild transpose cache
+        self._device_weight_t_cache.clear()
+        self._device_weight_cache.clear()
+        self._device_bias_cache.clear()
+
+    def _get_weight_host(self, layer_index: int) -> np.ndarray:
+        """Return weight matrix on host. Pulls from device if needed."""
+        w = self.weightsByLayer[layer_index]
+        if self.backend.is_device_array(w):
+            return self.backend.to_host(w)
+        return np.asarray(w, dtype=np.float32)
+
+    def _get_bias_host(self, layer_index: int) -> np.ndarray:
+        """Return bias vector on host. Pulls from device if needed."""
+        b = self.biasByLayer[layer_index]
+        if self.backend.is_device_array(b):
+            return self.backend.to_host(b)
+        return np.asarray(b, dtype=np.float32)
+    
     @staticmethod
     def _is_array_compatible(func, probe: np.ndarray) -> bool:
         """Return True when callable can consume/return ndarray with matching shape."""
@@ -172,6 +218,15 @@ class ArrayNetworkFeedforward:
         if self._paranoid_stabilize:
             return self._stabilize_host_array(x, clip_value=clip_value or self._grad_clip_guard)
         return x
+    
+    def _maybe_stabilize_dev(self, x, clip_value=None):
+        """Device-aware stabilization: soft-clip on device if possible."""
+        if self._paranoid_stabilize:
+            cv = clip_value or self._grad_clip_guard
+            if self.backend.is_device_array(x):
+                return self._soft_clip_backend(x, cv)
+            return self._stabilize_host_array(x, clip_value=cv)
+        return x
 
     def _apply_activation_backend(self, x, layer_index: int):
         # Try backend-native activation first (GPU-friendly path).
@@ -188,6 +243,9 @@ class ArrayNetworkFeedforward:
 
     def _get_device_weight(self, layer_index: int):
         # Lazy-upload each layer matrix once, then reuse until invalidated.
+        if self._device_resident_weights:
+            # Already on device
+            return self.weightsByLayer[layer_index]
         cached = self._device_weight_cache.get(layer_index)
         if cached is None:
             cached = self.backend.to_device(self.weightsByLayer[layer_index], dtype=np.float32)
@@ -195,16 +253,22 @@ class ArrayNetworkFeedforward:
         return cached
 
     def _get_device_weight_t(self, layer_index: int):
-        # Transposed cache is used in backprop delta propagation matmuls.
+        """Return transposed weight matrix on device (cached)."""
         cached = self._device_weight_t_cache.get(layer_index)
         if cached is None:
-            cached = self.backend.to_device(self.weightsByLayer[layer_index].T, dtype=np.float32)
+            if self._device_resident_weights:
+                w_host = self.backend.to_host(self.weightsByLayer[layer_index])
+            else:
+                w_host = self.weightsByLayer[layer_index]
+            cached = self.backend.to_device(np.ascontiguousarray(w_host.T), dtype=np.float32)
             self._device_weight_t_cache[layer_index] = cached
         return cached
 
     def _get_device_bias(self, layer_index: int):
         if not self.bias:
             return None
+        if self._device_resident_weights:
+            return self.biasByLayer[layer_index]
         cached = self._device_bias_cache.get(layer_index)
         if cached is None:
             cached = self.backend.to_device(self.biasByLayer[layer_index], dtype=np.float32)
@@ -212,15 +276,20 @@ class ArrayNetworkFeedforward:
         return cached
 
     def _invalidate_device_cache(self, layer_index=None):
-        # Called after parameter updates so stale device weights are never reused.
+        """Invalidate transpose cache after weight updates.
+        When weights are device-resident, the weight/bias caches are not used
+        (weightsByLayer IS the device array). Only the transpose cache needs
+        invalidation since it's derived from the weight values."""
         if layer_index is None:
-            self._device_weight_cache.clear()
             self._device_weight_t_cache.clear()
-            self._device_bias_cache.clear()
+            if not self._device_resident_weights:
+                self._device_weight_cache.clear()
+                self._device_bias_cache.clear()
             return
-        self._device_weight_cache.pop(layer_index, None)
         self._device_weight_t_cache.pop(layer_index, None)
-        self._device_bias_cache.pop(layer_index, None)
+        if not self._device_resident_weights:
+            self._device_weight_cache.pop(layer_index, None)
+            self._device_bias_cache.pop(layer_index, None)
 
     def set_cached_opencl(self, enabled: bool, min_batch: int = 8, cache_on_device: bool = False):
         # Control if cached forward path uses OpenCL and where cached tensors live.
@@ -309,9 +378,14 @@ class ArrayNetworkFeedforward:
         if (cached):
             self.outputsByLayerActivated=[]
             self.outputsByLayerNonActivated=[]
-        if (inputs.shape[1] != self.weightsByLayer[0].shape[0]):
+        if not self.backend.is_device_array(inputs):
+            input_cols = inputs.shape[1]
+        else:
+            input_cols = self.backend.to_host(inputs).shape[1]
+        w0 = self._get_weight_host(0) if self._device_resident_weights else self.weightsByLayer[0]
+        if (input_cols != w0.shape[0]):
             print("evaluateNetwork: Wrong number of inputs!")
-            print(str(inputs.shape[1]) + " Vs " + str(self.weightsByLayer[0].shape[0]))
+            print(str(input_cols) + " Vs " + str(w0.shape[0]))
             return None
         # Inputs are expected as (B x D) where B can be 1.
         temp = inputs
@@ -325,8 +399,11 @@ class ArrayNetworkFeedforward:
             )
         )
         
-        # if using_opencl:
-        #     temp = self.backend.to_device(temp, dtype=np.float32)
+        # When weights are device-resident, always use OpenCL path to avoid
+        # pulling weights to host for every forward pass.
+        if self._device_resident_weights:
+            using_opencl = True
+        
         # Forward pass through all layers.
         for i in range(self.layers):
         # For each layer:
@@ -368,19 +445,21 @@ class ArrayNetworkFeedforward:
         """
         for i in range(self.layers):
             print("The", i, "th layer has weights: ")
-            print(self.weightsByLayer[i])
+            w = self._get_weight_host(i) if self._device_resident_weights else self.weightsByLayer[i]
+            print(w)
             if self.bias:
-                print("The biases on layer", i, "are", self.biasByLayer[i])
+                b = self._get_bias_host(i) if self._device_resident_weights else self.biasByLayer[i]
+                print("The biases on layer", i, "are", b)
 
     def outputEmbedding(self):
         """ Prints the weights and biases of the network out
         """
+        w0 = self._get_weight_host(0) if self._device_resident_weights else self.weightsByLayer[0]
         with open("wordEmbedding.txt", "w") as txt_file:
-            for line in self.weightsByLayer[0]:
-                # txt_file.write(str(line.tolist()) + ",\n") # works with any number of elements in a line
+            for line in w0:
                 txt_file.write(" ".join(map(str, line)) + "\n")
             txt_file.close()
-        return self.weightsByLayer[0]
+        return w0
     
     def backpropDelta(self, outerGrad, clip_limit=1.0):
         """Propagate outer gradient to get dL/d(network_input).
@@ -401,7 +480,7 @@ class ArrayNetworkFeedforward:
         # GPU route keeps delta math on device for this pass.
         if self._use_device_backprop_math and self._use_opencl_backend:
             device_t0 = time.perf_counter() if self._internal_profiler_enabled else 0.0
-            delta = outerGrad#self.backend.to_device(outerGrad, dtype=np.float32)
+            delta = outerGrad
             for i in range(self.layers):
                 layer_idx = self.layers - 1 - i
                 preact = self.outputsByLayerNonActivated[layer_idx]
@@ -412,7 +491,6 @@ class ArrayNetworkFeedforward:
                 if clip_limit > 0:
                     delta = self._soft_clip_backend(delta, clip_limit)
             result = self._soft_clip_backend(delta, self._grad_clip_guard)
-            #result = self._stabilize_host_array(self.backend.to_host(delta), clip_value=self._grad_clip_guard)
             if self._internal_profiler_enabled:
                 t_end = time.perf_counter()
                 self._internal_profile_totals["backprop_delta_device"] += (t_end - device_t0)
@@ -436,11 +514,12 @@ class ArrayNetworkFeedforward:
             delta = np.multiply(delta, act_derivs)
             
             # Propagate through this layer's weights
-            delta = np.matmul(delta, self.weightsByLayer[layer_idx].T)
+            w_host = self._get_weight_host(layer_idx) if self._device_resident_weights else self.weightsByLayer[layer_idx]
+            delta = np.matmul(delta, w_host.T)
 
             # Clip after each layer to prevent amplification cascade
             if clip_limit > 0:
-                delta = soft_clip(delta, clip_limit)  # soft_clip instead of np.clip
+                delta = soft_clip(delta, clip_limit)
 
         result = self._stabilize_host_array(delta, clip_value=self._grad_clip_guard)
         if self._internal_profiler_enabled:
@@ -467,119 +546,237 @@ class ArrayNetworkFeedforward:
                 Momentum constant for how much of the previous update step's change should be applied in this step
         """
         update_t0 = time.perf_counter() if self._internal_profiler_enabled else 0.0
-        # Phase B: parameter update using cached activations and output diffs.
-        # This method is profiled in three sub-stages:
-        #   1) delta propagation
-        #   2) gradient build
-        #   3) weight/bias apply
-        #inputs_host = self.backend.to_host(inputs)
+
+
         device_update_path = self._use_device_backprop_math and self._use_opencl_backend
+
         if device_update_path:
-            inputs_dev = self.backend.to_device(inputs)      # no-op if already on device
-            inputs_host = None
+            self._update_device_path(inputs, diffs, learnRate, weightDecay, momentum, update_t0)
         else:
-            inputs_host = self.backend.to_host(inputs)
-            inputs_dev = None
-        #inputs_dev = self.backend.to_device(inputs_host, dtype=np.float32) if device_update_path else None
-        changeManifold = [] # Array of all the weight changes
-        biasManifold = [] # Array of all the bias changes
-        delta = None
-        delta_dev = self.backend.to_device(diffs, dtype=np.float32) if device_update_path else None
+            self._update_host_path(inputs, diffs, learnRate, weightDecay, momentum, update_t0)
+
+
+    def _update_device_path(self, inputs, diffs, learnRate, weightDecay, momentum, update_t0):
+        """Fully device-resident update path. Weights, velocities, gradients all stay on GPU."""
+        inputs_dev = self.backend.to_device(inputs, dtype=np.float32)
+        delta_dev = self.backend.to_device(diffs, dtype=np.float32)
+
+        changeManifold = []
+        biasManifold = []
         delta_stage_total = 0.0
         grad_stage_total = 0.0
-        # Build per-layer delta and gradients in reverse order.
+
+        lr_scalar = float(learnRate)
+        wd_scalar = float(weightDecay)
+        mom_scalar = float(momentum)
+        decay_factor = 1.0 - lr_scalar * wd_scalar
+
         for i in range(self.layers):
             delta_stage_t0 = time.perf_counter() if self._internal_profiler_enabled else 0.0
-            outputs_cached = self.outputsByLayerNonActivated[self.layers - i - 1]
-            if (i != self.layers - 1):
-                currentInputs_cached = self.outputsByLayerActivated[self.layers - i - 2]
+            layer_idx = self.layers - 1 - i
+            outputs_cached = self.outputsByLayerNonActivated[layer_idx]
+
+            if i != self.layers - 1:
+                currentInputs_dev = self.outputsByLayerActivated[self.layers - i - 2]
             else:
-                currentInputs_cached = inputs_dev if device_update_path else inputs_host  #(1 X inD)
-            # First layer in reverse uses raw network inputs; others use cached activations.
-            if (i != 0):
-            # The last layer has no outgoing weights and no previous deltas
-                if device_update_path:
-                    protoNewDeltas_dev = self.backend.matmul(delta_dev, self._get_device_weight_t(self.layers - i))
-                    act_deriv_dev = self._activation_derivative_backend(outputs_cached, self.layers - 1 - i)
-                    newDeltas_dev = self.backend.multiply(protoNewDeltas_dev, act_deriv_dev)
-                    # Keep propagation on device; host materialization happens in grad stage.
-                    if self._grad_clip_guard > 0:
-                        newDeltas_dev = self._soft_clip_backend(newDeltas_dev, self._grad_clip_guard)
-                    delta_dev = newDeltas_dev
-                else:
-                    outputs = self.backend.to_host(outputs_cached)
-                    outgoingWeights = self.weightsByLayer[self.layers - i] #(nextLayerD X curLayerD)
-                    protoNewDeltas = np.matmul(delta, outgoingWeights.T) # Delta is outgoing weights times the previous deltas (1 X curLayerD)
-                    act_deriv = self._apply_elementwise(self.layerAct[self.layers - 1 - i][1], outputs, self._act_deriv_fast[self.layers - 1 - i])
-                    newDeltas = self._stabilize_host_array(np.multiply(protoNewDeltas, act_deriv), clip_value=self._grad_clip_guard) #(1 X curLayerD)
+                currentInputs_dev = inputs_dev
+
+            # Ensure cached activations are on device
+            if not self.backend.is_device_array(currentInputs_dev):
+                currentInputs_dev = self.backend.to_device(currentInputs_dev, dtype=np.float32)
+
+            # Delta propagation
+            if i != 0:
+                # Sentinel weight at self.layers index for outgoing layer
+                protoNewDeltas_dev = self.backend.matmul(delta_dev, self._get_device_weight_t(layer_idx + 1))
+                act_deriv_dev = self._activation_derivative_backend(outputs_cached, layer_idx)
+                delta_dev = self.backend.multiply(protoNewDeltas_dev, act_deriv_dev)
             else:
-                if device_update_path:
-                    act_deriv_dev = self._activation_derivative_backend(outputs_cached, self.layers - 1 - i)
-                    newDeltas_dev = self.backend.multiply(delta_dev, act_deriv_dev)
-                    if self._grad_clip_guard > 0:
-                        newDeltas_dev = self._soft_clip_backend(newDeltas_dev, self._grad_clip_guard)
-                    delta_dev = newDeltas_dev
+                act_deriv_dev = self._activation_derivative_backend(outputs_cached, layer_idx)
+                delta_dev = self.backend.multiply(delta_dev, act_deriv_dev)
+
+            if self._grad_clip_guard > 0:
+                delta_dev = self._soft_clip_backend(delta_dev, self._grad_clip_guard)
+
+            if self._internal_profiler_enabled:
+                delta_stage_total += (time.perf_counter() - delta_stage_t0)
+
+            # Gradient build — on device
+            grad_stage_t0 = time.perf_counter() if self._internal_profiler_enabled else 0.0
+
+            # change = currentInputs.T @ delta  (prevD x batch) @ (batch x curD) = (prevD x curD)
+            change_dev = self.backend.matmul(
+                self.backend.transpose(currentInputs_dev),
+                delta_dev
+            )
+            if self._grad_clip_guard > 0:
+                change_dev = self._soft_clip_backend(change_dev, self._grad_clip_guard)
+
+            # Bias gradient: sum over batch dimension
+            bias_change_dev = self.backend.sum(delta_dev, axis=0, keepdims=True)
+            if self._grad_clip_guard > 0:
+                bias_change_dev = self._soft_clip_backend(bias_change_dev, self._grad_clip_guard)
+
+            if self._internal_profiler_enabled:
+                grad_stage_total += (time.perf_counter() - grad_stage_t0)
+
+            changeManifold.append((layer_idx, change_dev, bias_change_dev))
+
+        # Weight apply — all on device
+        weight_stage_t0 = time.perf_counter() if self._internal_profiler_enabled else 0.0
+
+        for layer_idx, change_dev, bias_change_dev in changeManifold:
+            w = self.weightsByLayer[layer_idx]
+
+            if mom_scalar > 0:
+                # velocity = momentum * velocity + change
+                self.weight_velocities[layer_idx] = self.backend.add(
+                    self.backend.multiply(mom_scalar, self.weight_velocities[layer_idx]),
+                    change_dev
+                )
+                effective_change = self.backend.multiply(lr_scalar, self.weight_velocities[layer_idx])
+            else:
+                effective_change = self.backend.multiply(lr_scalar, change_dev)
+
+            # w = w * (1 - lr * wd) + effective_change
+            decayed_w = self.backend.multiply(decay_factor, w)
+            self.weightsByLayer[layer_idx] = self.backend.add(decayed_w, effective_change)
+
+            if self._paranoid_stabilize:
+                self.weightsByLayer[layer_idx] = self._soft_clip_backend(
+                    self.weightsByLayer[layer_idx], self._weight_clip_guard
+                )
+
+            # Invalidate transpose cache since weights changed
+            self._device_weight_t_cache.pop(layer_idx, None)
+
+            if self.bias:
+                if mom_scalar > 0:
+                    self.bias_velocities[layer_idx] = self.backend.add(
+                        self.backend.multiply(mom_scalar, self.bias_velocities[layer_idx]),
+                        bias_change_dev
+                    )
+                    effective_bias = self.backend.multiply(lr_scalar, self.bias_velocities[layer_idx])
                 else:
-                    outputs = self.backend.to_host(outputs_cached)
-                    act_deriv = self._apply_elementwise(self.layerAct[self.layers - 1 - i][1], outputs, self._act_deriv_fast[self.layers - 1 - i])
-                    newDeltas = self._stabilize_host_array(np.multiply(diffs, act_deriv), clip_value=self._grad_clip_guard) #(1 X curLayerD)
+                    effective_bias = self.backend.multiply(lr_scalar, bias_change_dev)
+
+                self.biasByLayer[layer_idx] = self.backend.add(
+                    self.biasByLayer[layer_idx], effective_bias
+                )
+
+                if self._paranoid_stabilize:
+                    self.biasByLayer[layer_idx] = self._soft_clip_backend(
+                        self.biasByLayer[layer_idx], self._weight_clip_guard
+                    )
+
+        if self._internal_profiler_enabled:
+            update_t_end = time.perf_counter()
+            self._internal_profile_totals["update_delta_propagation"] += delta_stage_total
+            self._internal_profile_totals["update_gradient_build"] += grad_stage_total
+            self._internal_profile_totals["update_weight_apply"] += (update_t_end - weight_stage_t0)
+            self._internal_profile_totals["update_total"] += (update_t_end - update_t0)
+            self._internal_profile_counts["update_calls"] += 1
+
+    def _update_host_path(self, inputs, diffs, learnRate, weightDecay, momentum, update_t0):
+        """Original host-based update path for CPU backend."""
+        inputs_host = self.backend.to_host(inputs)
+
+        changeManifold = []
+        biasManifold = []
+        delta = None
+        delta_stage_total = 0.0
+        grad_stage_total = 0.0
+
+        for i in range(self.layers):
+            delta_stage_t0 = time.perf_counter() if self._internal_profiler_enabled else 0.0
+            layer_idx = self.layers - 1 - i
+            outputs = self.backend.to_host(self.outputsByLayerNonActivated[layer_idx])
+
+            if i != self.layers - 1:
+                currentInputs = self.backend.to_host(self.outputsByLayerActivated[self.layers - i - 2])
+            else:
+                currentInputs = inputs_host
+
+            if i != 0:
+                w_host = self._get_weight_host(layer_idx + 1) if self._device_resident_weights else self.weightsByLayer[layer_idx + 1]
+                protoNewDeltas = np.matmul(delta, w_host.T)
+                act_deriv = self._apply_elementwise(
+                    self.layerAct[layer_idx][1], outputs, self._act_deriv_fast[layer_idx]
+                )
+                newDeltas = self._stabilize_host_array(
+                    np.multiply(protoNewDeltas, act_deriv), clip_value=self._grad_clip_guard
+                )
+            else:
+                act_deriv = self._apply_elementwise(
+                    self.layerAct[layer_idx][1], outputs, self._act_deriv_fast[layer_idx]
+                )
+                newDeltas = self._stabilize_host_array(
+                    np.multiply(diffs, act_deriv), clip_value=self._grad_clip_guard
+                )
+
             if self._internal_profiler_enabled:
                 delta_stage_total += (time.perf_counter() - delta_stage_t0)
 
             grad_stage_t0 = time.perf_counter() if self._internal_profiler_enabled else 0.0
-            if device_update_path:
-                # newDeltas = delta_dev
-                newDeltas = self._maybe_stabilize(self.backend.to_host(delta_dev), clip_value=self._grad_clip_guard)
-                currentInputs = self.backend.to_host(currentInputs_cached)
-                # change_dev = self.backend.matmul_at_b(currentInputs_cached, newDeltas) #(prevLayerD X curLayerD)
-                # change = self._soft_clip_backend(change_dev, self._grad_clip_guard)
-                change = self._stabilize_host_array(np.matmul(currentInputs.T, newDeltas), clip_value=self._grad_clip_guard)
-                # changeBias = self.backend.sum(newDeltas, axis=0, keepdims=True)
-                # changeBias = self._soft_clip_backend(changeBias, self._grad_clip_guard)
-            else:
-                currentInputs = self.backend.to_host(currentInputs_cached)
-                change = self._stabilize_host_array(np.matmul(currentInputs.T, newDeltas), clip_value=self._grad_clip_guard) #(curLayerD X prevLayerD)
-            # Gradient tensors for this layer.
+            change = self._stabilize_host_array(
+                np.matmul(currentInputs.T, newDeltas), clip_value=self._grad_clip_guard
+            )
             changeBias = self._stabilize_host_array(
-                np.sum(newDeltas, axis=0, keepdims=True), 
-                clip_value=self._grad_clip_guard
-            ) # Bias is just product of learn rate and deltas # (1 X curLayerD)
+                np.sum(newDeltas, axis=0, keepdims=True), clip_value=self._grad_clip_guard
+            )
             if self._internal_profiler_enabled:
                 grad_stage_total += (time.perf_counter() - grad_stage_t0)
-            changeManifold.append(change)
-            biasManifold.append(changeBias)
-            # add both to the manifold
+
+            changeManifold.append((layer_idx, change, changeBias))
             delta = newDeltas
-            # set up for next layer
-        # Apply gradients with momentum + weight decay, then invalidate device caches.
+
+        # Apply gradients
         weight_stage_t0 = time.perf_counter() if self._internal_profiler_enabled else 0.0
-        for i in range(self.layers):
-            idx = self.layers - i - 1
-            change_h = changeManifold[i]
-            bias_h = biasManifold[i]
-            if isinstance(self.weightsByLayer[idx], np.ndarray):
-                if momentum > 0:
-                    self.weight_velocities[idx] = momentum * self.weight_velocities[idx] + change_h
-                    effective_change = learnRate * self.weight_velocities[idx]
+
+        for layer_idx, change_h, bias_h in changeManifold:
+            w_host = self._get_weight_host(layer_idx) if self._device_resident_weights else self.weightsByLayer[layer_idx]
+
+            if momentum > 0:
+                vel = self.backend.to_host(self.weight_velocities[layer_idx]) if self.backend.is_device_array(self.weight_velocities[layer_idx]) else self.weight_velocities[layer_idx]
+                vel = momentum * vel + change_h
+                effective_change = learnRate * vel
+                if self._device_resident_weights:
+                    self.weight_velocities[layer_idx] = self.backend.to_device(vel, dtype=np.float32)
                 else:
-                    effective_change = learnRate * change_h
+                    self.weight_velocities[layer_idx] = vel
+            else:
+                effective_change = learnRate * change_h
 
-                self.weightsByLayer[idx] = self._maybe_stabilize(
-                    np.add(self.weightsByLayer[idx] * (1 - learnRate * weightDecay), effective_change),
-                    clip_value=self._weight_clip_guard
-                )
-                self._invalidate_device_cache(idx)
-                if self.bias:
-                    if momentum > 0:
-                        self.bias_velocities[idx] = momentum * self.bias_velocities[idx] + bias_h
-                        effective_bias_change = learnRate * self.bias_velocities[idx]
+            new_w = self._maybe_stabilize(
+                np.add(w_host * (1 - learnRate * weightDecay), effective_change),
+                clip_value=self._weight_clip_guard
+            )
+            if self._device_resident_weights:
+                self.weightsByLayer[layer_idx] = self.backend.to_device(new_w, dtype=np.float32)
+            else:
+                self.weightsByLayer[layer_idx] = new_w
+            self._invalidate_device_cache(layer_idx)
+
+            if self.bias:
+                b_host = self._get_bias_host(layer_idx) if self._device_resident_weights else self.biasByLayer[layer_idx]
+                if momentum > 0:
+                    bv = self.backend.to_host(self.bias_velocities[layer_idx]) if self.backend.is_device_array(self.bias_velocities[layer_idx]) else self.bias_velocities[layer_idx]
+                    bv = momentum * bv + bias_h
+                    effective_bias = learnRate * bv
+                    if self._device_resident_weights:
+                        self.bias_velocities[layer_idx] = self.backend.to_device(bv, dtype=np.float32)
                     else:
-                        effective_bias_change = learnRate * bias_h
+                        self.bias_velocities[layer_idx] = bv
+                else:
+                    effective_bias = learnRate * bias_h
 
-                    self.biasByLayer[idx] = self._maybe_stabilize(
-                        np.add(self.biasByLayer[idx], effective_bias_change),
-                        clip_value=self._weight_clip_guard
-                    )
+                new_b = self._maybe_stabilize(
+                    np.add(b_host, effective_bias), clip_value=self._weight_clip_guard
+                )
+                if self._device_resident_weights:
+                    self.biasByLayer[layer_idx] = self.backend.to_device(new_b, dtype=np.float32)
+                else:
+                    self.biasByLayer[layer_idx] = new_b
 
         if self._internal_profiler_enabled:
             update_t_end = time.perf_counter()

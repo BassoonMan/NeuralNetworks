@@ -311,10 +311,21 @@ if __name__ == "__main__":
         for layer in inn.layers:
             for net in [layer.s1, layer.s2, layer.t1, layer.t2]:
                 for i in range(net.layers):
-                    if isinstance(net.weight_velocities[i], np.ndarray):
-                        net.weight_velocities[i] = np.zeros_like(net.weight_velocities[i])
+                    v = net.weight_velocities[i]
+                    if net.backend.is_device_array(v):
+                        net.weight_velocities[i] = net.backend.to_device(
+                            np.zeros_like(net.backend.to_host(v)), dtype=np.float32
+                        )
+                    elif isinstance(v, np.ndarray):
+                        net.weight_velocities[i] = np.zeros_like(v)
                     if net.bias:
-                        net.bias_velocities[i] = np.zeros_like(net.bias_velocities[i])
+                        bv = net.bias_velocities[i]
+                        if net.backend.is_device_array(bv):
+                            net.bias_velocities[i] = net.backend.to_device(
+                                np.zeros_like(net.backend.to_host(bv)), dtype=np.float32
+                            )
+                        else:
+                            net.bias_velocities[i] = np.zeros_like(bv)
 
     reset_velocities(inn)
 
