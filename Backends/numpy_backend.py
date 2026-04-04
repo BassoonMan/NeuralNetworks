@@ -91,6 +91,9 @@ class NumpyBackend:
             val = np.where(val >= 0, val, 0.01 * val)
         elif act_type == 2:      # tanh
             val = np.tanh(val)
+        elif act_type == 3:
+            half = val.shape[1] // 2
+            val[:, :half] = np.tanh(val[:, :half])
         return val
     
     def fused_sgd_update(self, weights, velocity, gradient, lr, momentum, decay_factor):
@@ -130,6 +133,11 @@ class NumpyBackend:
         elif act_type == 2:      # tanh derivative
             t = np.tanh(pre)
             d = (1.0 - t * t).astype(np.float32)
+        elif act_type == 3:
+            half = pre.shape[1] // 2
+            d = np.ones_like(pre, dtype=np.float32)
+            t = np.tanh(pre[:, :half])
+            d[:, :half] = (1.0 - t * t).astype(np.float32)
         else:                    # identity derivative
             d = np.ones_like(pre, dtype=np.float32)
         val = inp * d
@@ -171,6 +179,18 @@ class NumpyBackend:
             post_act = np.where(pre_act >= 0, pre_act, 0.01 * pre_act)
         elif act_type == 2:      # tanh
             post_act = np.tanh(pre_act)
+        elif act_type == 3:
+            half = pre_act.shape[1] // 2
+            post_act = pre_act.copy()
+            post_act[:, :half] = np.tanh(post_act[:, :half])
         else:                    # identity
             post_act = pre_act.copy()
         return pre_act, post_act
+    
+    def coupling_forward_merged(self, u, st_raw, limit=2.0):
+        """v = u * exp(soft_clip(s_raw, limit)) + t, 
+        where s_raw = st_raw[:, :half], t = st_raw[:, half:]"""
+        st = np.asarray(st_raw, dtype=np.float32)
+        half = st.shape[1] // 2
+        s_clipped = limit * np.tanh(st[:, :half] / limit)
+        return np.asarray(u) * np.exp(s_clipped) + st[:, half:]

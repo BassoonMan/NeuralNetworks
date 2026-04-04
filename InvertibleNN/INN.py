@@ -18,7 +18,7 @@ class InvertibleNeuralNetwork:
         # Stack of affine coupling layers. Composition remains invertible.
         self.layers = []
         for i in range(layers):
-            self.layers.append(AffCouplingLayer(in_out_length, internalLayers, internalLayerLength, backend=backend))
+            self.layers.append(AffCouplingLayer(in_out_length, internalLayers, internalLayerLength, backend=backend, batch_size=batch_size))
         # Top-level step profiler (minibatch granularity). This I think just keeps track of total timings.
         self._profiler_enabled = False
         self._profile_totals = {
@@ -28,7 +28,8 @@ class InvertibleNeuralNetwork:
             "train_step_total": 0.0,
         }
         self._profile_steps = 0
-        self.backend = get_backend(backend, batch_size=batch_size, vector_size=vector_size, internal_width=internalLayerLength)
+        print(batch_size, vector_size, internalLayerLength)
+        self.backend = get_backend(backend, batch_size=batch_size, vector_size=vector_size, internal_width=internalLayerLength*2)
 
 
     ##################
@@ -39,10 +40,10 @@ class InvertibleNeuralNetwork:
         self._profiler_enabled = bool(enabled)
 
     def enable_internal_network_profiler(self, enabled=True):
-        # Propagates profiler state into every sub-network (s1/s2/t1/t2 in each layer).
+        # Propagates profiler state into every sub-network (st1/st2 in each layer).
         state = bool(enabled)
         for layer in self.layers:
-            for net in (layer.s1, layer.s2, layer.t1, layer.t2):
+            for net in (layer.st1, layer.st2):
                 if hasattr(net, "enable_internal_profiler"):
                     net.enable_internal_profiler(state)
 
@@ -53,7 +54,7 @@ class InvertibleNeuralNetwork:
 
     def reset_internal_network_profile(self):
         for layer in self.layers:
-            for net in (layer.s1, layer.s2, layer.t1, layer.t2):
+            for net in (layer.st1, layer.st2):
                 if hasattr(net, "reset_internal_profile"):
                     net.reset_internal_profile()
 
@@ -87,7 +88,7 @@ class InvertibleNeuralNetwork:
         }
 
         for layer in self.layers:
-            for net in (layer.s1, layer.s2, layer.t1, layer.t2):
+            for net in (layer.st1, layer.st2):
                 if hasattr(net, "get_internal_profile"):
                     prof = net.get_internal_profile(reset=False)
                     for key in aggregate_totals:
@@ -314,7 +315,7 @@ if __name__ == "__main__":
 
     def reset_velocities(inn):
         for layer in inn.layers:
-            for net in [layer.s1, layer.s2, layer.t1, layer.t2]:
+            for net in [layer.st1, layer.st2]:
                 for i in range(net.layers):
                     v = net.weight_velocities[i]
                     if net.backend.is_device_array(v):

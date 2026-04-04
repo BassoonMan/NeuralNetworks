@@ -38,7 +38,7 @@ class ArrayNetworkFeedforward:
         Updates the network weights using gradient descent
     """
     #
-    def __init__(self, inputCount, layers, neuronPerLayer, layerAct, random = False, isBias = True, backend="cpu"):
+    def __init__(self, inputCount, layers, neuronPerLayer, layerAct, random = False, isBias = True, backend="cpu", batch_size=128, vector_size=None, internal_width=None):
         """ Sets up the network, randomizing the initial weights
          
         Parameters:
@@ -63,6 +63,7 @@ class ArrayNetworkFeedforward:
         self.outputsByLayerActivated = [] # Should always be stored as an array of (1 X layerDim)
         self.layerAct = [] # List of activation functions and their derivatives
         # Backend object (NumPy for CPU, OpenCL backend for GPU path).
+        print(inputCount, neuronPerLayer, batch_size)
         self.backend = get_backend(backend)
         self.backend_name = backend
         self._use_opencl_backend = backend.lower() in ("opencl", "gpu", "amd")
@@ -483,6 +484,8 @@ class ArrayNetworkFeedforward:
             return 1
         elif activation_name == 'tanh':
             return 2
+        elif activation_name == 'split_tanh_identity':  # <-- NEW
+            return 3
         else:
             return 0
     
