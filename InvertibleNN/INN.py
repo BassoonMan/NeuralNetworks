@@ -9,9 +9,12 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from Misc.MNIST import MnistDataloader as Mnist
+from Backends import get_backend
+import gc
+gc.disable()  # disable automatic collection
 
 class InvertibleNeuralNetwork:
-    def __init__(self, layers, in_out_length, internalLayers=2, internalLayerLength=8, backend="cpu"):
+    def __init__(self, layers, in_out_length, internalLayers=2, internalLayerLength=8, backend="cpu", batch_size=128, vector_size=64):
         # Stack of affine coupling layers. Composition remains invertible.
         self.layers = []
         for i in range(layers):
@@ -25,6 +28,8 @@ class InvertibleNeuralNetwork:
             "train_step_total": 0.0,
         }
         self._profile_steps = 0
+        self.backend = get_backend(backend, batch_size=batch_size, vector_size=vector_size, internal_width=internalLayerLength)
+
 
     ##################
     # Profiler stuff #
@@ -105,7 +110,7 @@ class InvertibleNeuralNetwork:
         # Forward composition through all coupling layers.
         for layer in self.layers:
             x = layer.forward(x)
-        return x
+        return self.backend.to_host(x)
 
     def forward_batch(self, inputs, batch_size=None):
         """Run inference on a batch of inputs.
@@ -136,7 +141,7 @@ class InvertibleNeuralNetwork:
         # Inverse composition through coupling layers in reverse order.
         for layer in reversed(self.layers):
             y = layer.backward(y)
-        return y
+        return self.backend.to_host(y)
 
     def backward_batch(self, outputs, batch_size=None):
         """Run inverse inference on a batch of outputs.
@@ -176,7 +181,8 @@ class InvertibleNeuralNetwork:
     
     def backpropagate(self, diffs, learningRate, momentum=0.9):
         # Propagate dL/dOutput backward across coupling stack.
-        current_diffs = diffs
+        
+        current_diffs = self.backend.to_device(diffs)
         for layer in reversed(self.layers):
             input_diffs = layer.backpropagate(layer.forward_input, learningRate, current_diffs, momentum=momentum)
             current_diffs = input_diffs
@@ -200,11 +206,12 @@ class InvertibleNeuralNetwork:
         batch_inputs = np.vstack([sample[0] for sample in batch_samples])
         batch_targets = np.vstack([sample[1] for sample in batch_samples])
 
+
         # Timing checkpoints for top-level step profiler.
         step_t0 = time.perf_counter() if self._profiler_enabled else 0.0
 
         t0 = time.perf_counter() if self._profiler_enabled else 0.0
-        calc_outputs = self.train_forward(batch_inputs)
+        calc_outputs = self.backend.to_host(self.train_forward(batch_inputs))
         t1 = time.perf_counter() if self._profiler_enabled else 0.0
 
         raw_diffs = batch_targets - calc_outputs
@@ -214,7 +221,7 @@ class InvertibleNeuralNetwork:
         self.backpropagate(diffs, learningRate, momentum=momentum)
         t3 = time.perf_counter() if self._profiler_enabled else 0.0
 
-        raw_diffs = batch_targets - calc_outputs
+        # raw_diffs = batch_targets - calc_outputs
         loss = 0.5 * np.sum(raw_diffs ** 2) / len(batch_samples)
 
         if self._profiler_enabled:
@@ -263,7 +270,7 @@ class InvertibleNeuralNetwork:
 
 if __name__ == "__main__":
     testSet3 = []
-    backend = "cpu"  # "cpu" or "opencl"
+    backend = "opencl"  # "cpu" or "opencl"
     vector_size = 28*28
     dataset_size = 2048
     internal_layers = 2
@@ -276,10 +283,6 @@ if __name__ == "__main__":
         # Deterministic bijection-like target pattern for stress/perf testing.
         out = 0.1 + 0.8 * np.roll(inp, 1)
         testSet3.append([np.atleast_2d(inp), np.atleast_2d(out)])
-
-    inn = InvertibleNeuralNetwork(5, vector_size, internal_layers, hidden_width, backend=backend)
-    inn.enable_step_profiler(True)
-    inn.enable_internal_network_profiler(True)
 
 
     imager = Mnist()
@@ -305,7 +308,9 @@ if __name__ == "__main__":
     total_iterations = num_epochs * updates_per_epoch
     global_iteration = 0
 
-
+    inn = InvertibleNeuralNetwork(5, vector_size, internal_layers, hidden_width, backend=backend, batch_size=batch_size, vector_size=vector_size)
+    inn.enable_step_profiler(True)
+    inn.enable_internal_network_profiler(True)
 
     def reset_velocities(inn):
         for layer in inn.layers:
@@ -399,7 +404,9 @@ if __name__ == "__main__":
         if epoch_error < 0.000001:
             print(f"Converged at epoch {epoch+1}")
             break
+        gc.collect()
 
+    gc.collect()
     print(f"Time: {time.perf_counter() - startTime:.2f}s")
     # plt.plot(output_error_track)
     # plt.yscale('log')  # log scale shows convergence progress better

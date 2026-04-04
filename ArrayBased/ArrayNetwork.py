@@ -225,6 +225,7 @@ class ArrayNetworkFeedforward:
             cv = clip_value or self._grad_clip_guard
             if self.backend.is_device_array(x):
                 return self._soft_clip_backend(x, cv)
+            
             return self._stabilize_host_array(x, clip_value=cv)
         return x
 

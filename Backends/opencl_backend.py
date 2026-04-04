@@ -14,6 +14,22 @@ try:
 except Exception:  # pragma: no cover
     pyclblast = None
 
+class _DeviceBufferRing:
+    """Round-robin pool of pre-allocated device buffers for a fixed shape.
+    Each call to next() returns the next buffer in a circular fashion.
+    Safe when the number of simultaneously live results never exceeds pool size.
+    """
+    __slots__ = ("_bufs", "_idx")
+
+    def __init__(self, queue, shape, n, dtype=np.float32):
+        self._bufs = [cl_array.empty(queue, shape, dtype=dtype) for _ in range(n)]
+        self._idx = 0
+
+    def next(self):
+        buf = self._bufs[self._idx]
+        self._idx = (self._idx + 1) % len(self._bufs)
+        return buf
+
 
 class OpenCLBackend:
     # CUDA mental model mapping:
@@ -94,41 +110,6 @@ class OpenCLBackend:
             acc += X[row * N + col];
         }
         Y[col] = acc;
-    }
-
-    __kernel void matmul_at_b_f32(
-        __global const float* A,
-        __global const float* B,
-        __global float* C,
-        const int M,
-        const int N,
-        const int K)
-    {
-        // C[M, N] = A^T[M, K] @ B[K, N]
-        // A is stored as [K, M] (row-major), so A^T[m, k] = A[k * M + m]
-        const int row = get_global_id(0);
-        const int col = get_global_id(1);
-        if (row >= M || col >= N) return;
-        float acc = 0.0f;
-        for (int k = 0; k < K; ++k) {
-            acc += A[k * M + row] * B[k * N + col];
-        }
-        C[row * N + col] = acc;
-    }
-
-    // Forward coupling: v = u * exp(soft_clip(s_raw, limit)) + t
-    __kernel void coupling_forward_f32(
-        __global const float* U,
-        __global const float* S_raw,
-        __global const float* T,
-        __global float* V,
-        const float limit,
-        const int N)
-    {
-        const int i = get_global_id(0);
-        if (i >= N) return;
-        float s_clipped = limit * tanh(S_raw[i] / limit);
-        V[i] = U[i] * exp(s_clipped) + T[i];
     }
 
     // Backward coupling: u = (v - t) * exp(-soft_clip(s_raw, limit))
@@ -408,6 +389,22 @@ class OpenCLBackend:
             U2[row * half_N + (col - half_N)] = val;
         }
     }
+
+    // Forward coupling: v = u * exp(soft_clip(s_raw, limit)) + t
+    __kernel void coupling_forward_f32(
+        __global const float* U,
+        __global const float* S_raw,
+        __global const float* T,
+        __global float* V,
+        const float limit,
+        const int N)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+        float s_clipped = limit * tanh(S_raw[i] / limit);
+        V[i] = U[i] * exp(s_clipped) + T[i];
+    }
+
     // out[row, inv_perm[col]] = left_or_right_half[row, col]
     __kernel void concat_invperm_f32(
         __global const float* U1, __global const float* U2,
@@ -426,6 +423,36 @@ class OpenCLBackend:
         }
         out[row * (2 * half_N) + col] = val;
     }
+
+    __kernel void fused_forward_invperm_f32(
+        __global const float* V1,
+        __global const float* U2,
+        __global const int* inv_perm,
+        __global const float* S_raw,
+        __global const float* T,
+        __global float* out,
+        const int M,
+        const int half_N,
+        const float limit)
+    {
+
+        float s_clipped;
+
+        const int row = get_global_id(0);
+        const int col = get_global_id(1);
+        if (row >= M || col >= 2 * half_N) return;
+        int src_col = inv_perm[col];
+        float val;
+        if (src_col < half_N) {
+            val = V1[row * half_N + src_col];
+        } else {
+            s_clipped = limit * tanh(S_raw[row * half_N + (src_col - half_N)] / limit);
+            val = U2[row * half_N + (src_col - half_N)] * exp(s_clipped) + T[row * half_N + (src_col - half_N)];
+        }
+        out[row * (2 * half_N) + col] = val;
+    }
+
+
     // One kernel, two outputs:
     //   pre_act[row, col] = X[row, col] + B[col]
     //   post_act[row, col] = activation(X[row, col] + B[col])
@@ -453,9 +480,23 @@ class OpenCLBackend:
 
         post_act[row * N + col] = val;      // activated output
     }
+
+    // Transposes a matrix
+    __kernel void transpose_f32(
+        __global const float* X,        // (M, N) matrix to transpose
+        __global float* out,        // (N, M) Transposed output
+        const int M,
+        const int N)
+    {
+        const int row = get_global_id(0);
+        const int col = get_global_id(1);
+        if (row >= M || col >= N) return;
+
+        out[col * M + row] = X[row * N + col];
+    }
     """
 
-    def __init__(self, preferred_device_type="gpu"):
+    def __init__(self, batch_size=128, vector_size=64, internal_width=64, preferred_device_type="gpu"):
         # Prefer GPU when available; fallback selection is handled in factory.
         if cl is None or cl_array is None:
             raise RuntimeError("pyopencl is not available")
@@ -489,7 +530,6 @@ class OpenCLBackend:
         self._add_row_broadcast_kernel = cl.Kernel(self._program, "add_row_broadcast_f32")
         self._soft_clip_kernel = cl.Kernel(self._program, "soft_clip_f32")
         self._sum_axis0_kernel = cl.Kernel(self._program, "sum_axis0_f32")
-        self._matmul_at_b_kernel = cl.Kernel(self._program, "matmul_at_b_f32")
         self._coupling_forward_kernel = cl.Kernel(self._program, "coupling_forward_f32")
         self._coupling_backward_kernel = cl.Kernel(self._program, "coupling_backward_f32")
         self._coupling_s_outer_kernel = cl.Kernel(self._program, "coupling_s_outer_grad_f32")
@@ -508,11 +548,43 @@ class OpenCLBackend:
         self._fused_delta_act_clip_kernel = cl.Kernel(self._program, "fused_delta_act_clip_f32")
         self._concat_invperm_kernel = cl.Kernel(self._program, "concat_invperm_f32")
         self._fused_bias_act_dual_kernel = cl.Kernel(self._program, "fused_bias_act_dual_f32")
+        self._fused_forward_invperm_kernel = cl.Kernel(self._program, "fused_forward_invperm_f32")
+        self._transpose_kernel = cl.Kernel(self._program, "transpose_f32")
         self._has_pyclblast = pyclblast is not None
         # If CLBlast fails once on this runtime/device, disable and fallback to
         # custom kernel to avoid repeated exception overhead.
         self._disable_pyclblast = False
         self._force_kernel_matmul = False
+        
+        self.half = vector_size // 2
+        self.full = vector_size
+        self.batch = batch_size
+        self.hidden = internal_width
+
+        # Initializing buffers to reused space
+        # self.buffer_batch_full = cl_array.empty(self.queue, (self.batch, self.full), dtype=np.float32)
+        # self.buffer_batch_half = cl_array.empty(self.queue, (self.batch, self.half), dtype=np.float32)
+        # self.buffer_single_full = cl_array.empty(self.queue, (1, self.full), dtype=np.float32)
+        # self.buffer_single_half = cl_array.empty(self.queue, (1, self.half), dtype=np.float32)
+        # self.buffer_batch_hidden = cl_array.empty(self.queue, (self.batch, self.hidden), dtype=np.float32)
+        # self.buffer_single_hidden = cl_array.empty(self.queue, (1, self.hidden), dtype=np.float32)
+
+        _RING_N = 8  # max simultaneously live buffers of any one shape
+
+        # Replace self.buffer_batch_full / buffer_batch_half / etc. with:
+        self._ring_batch_full   = _DeviceBufferRing(self.queue, (self.batch, self.full),   _RING_N)
+        self._ring_batch_half   = _DeviceBufferRing(self.queue, (self.batch, self.half),   _RING_N)
+        self._ring_single_full  = _DeviceBufferRing(self.queue, (1,          self.full),   _RING_N)
+        self._ring_single_half  = _DeviceBufferRing(self.queue, (1,          self.half),   _RING_N)
+        self._ring_batch_hidden = _DeviceBufferRing(self.queue, (self.batch, self.hidden), _RING_N)
+        self._ring_single_hidden= _DeviceBufferRing(self.queue, (1,          self.hidden), _RING_N)
+
+        # These don't need buffer rings since they are used infrequently.
+        self.matmulatb_hidden_half = cl_array.empty(self.queue, (self.hidden, self.half), dtype=np.float32)
+        self.matmulatb_half_hidden = cl_array.empty(self.queue, (self.half, self.hidden), dtype=np.float32)
+
+
+
     def set_matmul_engine(self, engine="auto"):
         # auto    -> prefer CLBlast then fallback kernel
         # clblast -> force CLBlast usage (raises if unavailable)
@@ -555,7 +627,17 @@ class OpenCLBackend:
         if k_a != k_b:
             raise ValueError(f"OpenCL matmul shape mismatch: {ad.shape} x {bd.shape}")
 
-        out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        if m == 1:
+            if n == self.half:   out = self._ring_single_half.next()
+            elif n == self.hidden: out = self._ring_single_hidden.next()
+            else: out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        elif m == self.batch:
+            if n == self.half:   out = self._ring_batch_half.next()
+            elif n == self.hidden: out = self._ring_batch_hidden.next()
+            else: out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        else:
+            out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+
 
         # Fast-path: CLBlast GEMM (typically much faster than the naive kernel).
         # pyclblast expects pyopencl array objects (not raw buffers).
@@ -596,7 +678,7 @@ class OpenCLBackend:
         )
         return out
 
-    def add(self, a, b):
+    def add(self, a, b): # Unused
         # Device fast-path when either operand is already on device.
         if self.is_device_array(a) or self.is_device_array(b):
             ad = self.to_device(a)
@@ -611,6 +693,7 @@ class OpenCLBackend:
                     if bd.shape[0] == 1 and ad.shape[0] >= 1:
                         m, n = ad.shape
                         out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+                        print(m,n)
                         self._add_row_broadcast_kernel(
                             self.queue,
                             (int(m), int(n)),
@@ -624,6 +707,7 @@ class OpenCLBackend:
                         return out
                     if ad.shape[0] == 1 and bd.shape[0] >= 1:
                         m, n = bd.shape
+                        print(m,n)
                         out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
                         self._add_row_broadcast_kernel(
                             self.queue,
@@ -641,7 +725,7 @@ class OpenCLBackend:
             return self.to_device(np.add(self.to_host(ad), self.to_host(bd)), dtype=np.float32)
         return np.add(a, b)
 
-    def subtract(self, a, b):
+    def subtract(self, a, b): # Unused
         if np.isscalar(a) and self.is_device_array(b):
             return float(a) - b
         if self.is_device_array(a) and np.isscalar(b):
@@ -677,15 +761,15 @@ class OpenCLBackend:
     def soft_clip(self, x, limit=2.0):
         """Fused soft_clip: limit * tanh(x / limit) in a single kernel."""
         xd = self.to_device(x, dtype=np.float32)
-        n = xd.size
         out = cl_array.empty(self.queue, xd.shape, dtype=np.float32)
+        n = xd.size
         self._soft_clip_kernel(
             self.queue, (int(n),), None,
             xd.data, out.data, np.float32(limit), np.int32(n),
         )
         return out
     
-    def sum(self, x, axis=None, keepdims=False):
+    def sum(self, x, axis=None, keepdims=False): # Device path unused
         if self.is_device_array(x):
             if axis is None:
                 result = cl_array.sum(x)
@@ -695,6 +779,8 @@ class OpenCLBackend:
                 return result
             if axis == 0 and len(x.shape) == 2:
                 m, n = x.shape
+
+
                 out = cl_array.empty(self.queue, (1, n) if keepdims else (n,), dtype=np.float32)
                 self._sum_axis0_kernel(
                     self.queue, (int(n),), None,
@@ -704,31 +790,25 @@ class OpenCLBackend:
             result = np.sum(x.get(), axis=axis, keepdims=keepdims)
             return self.to_device(result, dtype=np.float32)
         return np.sum(x, axis=axis, keepdims=keepdims)
-    
-    def matmul_at_b(self, a, b):
-        """Compute A^T @ B without materializing the transpose."""
-        ad = self.to_device(a, dtype=np.float32)
-        bd = self.to_device(b, dtype=np.float32)
-        # A is (K, M), A^T is (M, K), B is (K, N), result is (M, N)
-        k, m = ad.shape
-        k2, n = bd.shape
-        if k != k2:
-            raise ValueError(f"matmul_at_b shape mismatch: A ({k},{m}) B ({k2},{n})")
-        out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
-        self._matmul_at_b_kernel(
-            self.queue, (int(m), int(n)), None,
-            ad.data, bd.data, out.data,
-            np.int32(m), np.int32(n), np.int32(k),
-        )
-        return out
-    
+
     def coupling_forward(self, u, s_raw, t, limit=2.0):
         """v = u * exp(soft_clip(s_raw, limit)) + t — single kernel."""
         ud = self.to_device(u, dtype=np.float32)
         sd = self.to_device(s_raw, dtype=np.float32)
         td = self.to_device(t, dtype=np.float32)
+
+
+        m, n = ud.shape
+        if (m == self.batch and n==self.half):
+            out = self._ring_batch_half.next()
+            # out = self.buffer_batch_half
+        elif (m == 1 and n==self.half):
+            out = self._ring_single_half.next()
+            # out = self.buffer_single_half
+        else:
+            out = cl_array.empty(self.queue, ud.shape, dtype=np.float32)
         n = ud.size
-        out = cl_array.empty(self.queue, ud.shape, dtype=np.float32)
+        # out = cl_array.empty(self.queue, ud.shape, dtype=np.float32)
         self._coupling_forward_kernel(
             self.queue, (int(n),), None,
             ud.data, sd.data, td.data, out.data,
@@ -756,8 +836,17 @@ class OpenCLBackend:
         dd = self.to_device(diff, dtype=np.float32)
         ud = self.to_device(u, dtype=np.float32)
         sd = self.to_device(s_raw, dtype=np.float32)
+        m, n = dd.shape
+        if (m == self.batch and n==self.half):
+            out = self._ring_batch_half.next()
+            # out = self.buffer_batch_half
+        elif (m == 1 and n==self.half):
+            out = self._ring_single_half.next()
+            # out = self.buffer_single_half
+        else:
+            out = cl_array.empty(self.queue, dd.shape, dtype=np.float32)
         n = dd.size
-        out = cl_array.empty(self.queue, dd.shape, dtype=np.float32)
+        # out = cl_array.empty(self.queue, dd.shape, dtype=np.float32)
         if clip_limit > 0:
             self._coupling_s_outer_clipped_kernel(
                 self.queue, (int(n),), None,
@@ -776,8 +865,13 @@ class OpenCLBackend:
         """du = diff * exp(soft_clip(s_raw, limit)) — single kernel."""
         dd = self.to_device(diff, dtype=np.float32)
         sd = self.to_device(s_raw, dtype=np.float32)
+        m, n = dd.shape
+        if (m == self.batch and n==self.half):
+            out = self._ring_batch_half.next()
+            # out = self.buffer_batch_half
+        else:
+            out = cl_array.empty(self.queue, dd.shape, dtype=np.float32)
         n = dd.size
-        out = cl_array.empty(self.queue, dd.shape, dtype=np.float32)
         self._coupling_input_grad_kernel(
             self.queue, (int(n),), None,
             dd.data, sd.data, out.data,
@@ -785,7 +879,7 @@ class OpenCLBackend:
         )
         return out
 
-    def apply_activation(self, x, func_name):
+    def apply_activation(self, x, func_name): # Unused?
         xd = self.to_device(x)
         if func_name == "leakyReLU":
             n = xd.size
@@ -801,7 +895,7 @@ class OpenCLBackend:
             return xd
         return None
 
-    def apply_activation_derivative(self, x, func_name):
+    def apply_activation_derivative(self, x, func_name): # Unused?
         xd = self.to_device(x)
         if func_name == "leakyReLU":
             n = xd.size
@@ -828,8 +922,14 @@ class OpenCLBackend:
     def transpose(self, x):
         """Return a contiguous transposed copy on device."""
         if self.is_device_array(x):
-            x_h = x.get()
-            return cl_array.to_device(self.queue, np.ascontiguousarray(x_h.T))
+            m, n = x.shape
+            out = cl_array.empty(self.queue, (n, m), dtype=np.float32)
+            self._transpose_kernel(
+                self.queue, (int(m), int(n)), None,
+                x.data, out.data,
+                np.int32(m), np.int32(n),
+            )
+            return out
         return np.ascontiguousarray(np.asarray(x).T)
 
     def fused_bias_act(self, x, bias, act_type):
@@ -876,7 +976,13 @@ class OpenCLBackend:
         k2, n = bd.shape
         if k != k2:
             raise ValueError(f"matmul_at_b shape mismatch: A ({k},{m}) B ({k2},{n})")
-        out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        # print(m, n)
+        if (m == self.hidden and n == self.half):
+            out = self.matmulatb_hidden_half
+        elif (m == self.half and n == self.hidden):
+            out = self.matmulatb_half_hidden
+        else:
+            out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
         self._fused_matmul_at_b_clip_kernel(
             self.queue, (int(m), int(n)), None,
             ad.data, bd.data, out.data,
@@ -887,7 +993,14 @@ class OpenCLBackend:
     def sum_axis0_clip(self, x, clip):
         """Compute sum along axis 0 with clipping."""
         m, n = x.shape
-        out = cl_array.empty(self.queue, (1, n), dtype=np.float32)
+        if (n==self.half):
+            out = self._ring_single_half.next()
+            # out = self.buffer_batch_half
+        elif (n==self.hidden):
+            out = self._ring_single_hidden.next()
+            # out = self.buffer_single_half
+        else:
+            out = cl_array.empty(self.queue, (1, n), dtype=np.float32)
         self._fused_sum_axis0_clip_kernel(
             self.queue, (int(n),), None,
             x.data, out.data,
@@ -899,7 +1012,16 @@ class OpenCLBackend:
         """Compute input_delta * act_deriv(preact) with optional clipping in one kernel.
         inputs: pre-activation values (for computing act_deriv)"""
         m, n = inputs.shape
-        out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        # print(m, n)
+        if (m == self.batch and n==self.half):
+            out = self._ring_batch_half.next()
+            # out = self.buffer_batch_half
+        elif (m == self.batch and n==self.hidden):
+            out = self._ring_batch_hidden.next()
+            # out = self.buffer_batch_hidden
+        else:
+            out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        # out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
         self._fused_delta_act_clip_kernel(
             self.queue, (int(n*m),), None,
             inputs.data, outputs.data, out.data, np.int32(act_type), np.float32(clip), np.int32(n*m),
@@ -909,7 +1031,13 @@ class OpenCLBackend:
     def add3_clip(self, A, B, C, clip):
         """Compute sum along axis 0 with clipping."""
         m, n = A.shape
-        out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        # print(m, n)
+        if (m == self.batch and n==self.half):
+            out = self._ring_batch_half.next()
+            # out = self.buffer_batch_half
+        else:
+            out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        # out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
         self._add3_clip_kernel(
             self.queue, (int(n*m),), None,
             A.data, B.data, C.data, out.data, np.float32(clip), np.int32(n*m),
@@ -920,12 +1048,18 @@ class OpenCLBackend:
         """Permutes and splits the input array."""
         x = self.to_device(x, dtype=np.float32)
         m, n = x.shape
-        perm_dev = self.to_device(perm, dtype=np.int32)
-        out1 = cl_array.empty(self.queue, (m, n//2), dtype=np.float32)
-        out2 = cl_array.empty(self.queue, (m, n//2), dtype=np.float32)
+        if (m == self.batch and n==self.half):
+            out1 = self._ring_batch_half.next()
+            out2 = self._ring_batch_half.next()
+        elif (m == 1 and n==self.half):
+            out1 = self._ring_single_half.next()
+            out2 = self._ring_single_half.next()
+        else:
+            out1 = cl_array.empty(self.queue, (m, n//2), dtype=np.float32)
+            out2 = cl_array.empty(self.queue, (m, n//2), dtype=np.float32)
         self._permute_split_kernel(
             self.queue, (int(m), int(n)), None,
-            x.data, perm_dev.data, out1.data, out2.data, np.int32(m), np.int32(n), np.int32(n//2),
+            x.data, perm.data, out1.data, out2.data, np.int32(m), np.int32(n), np.int32(n//2),
         )
         return out1, out2
     
@@ -935,7 +1069,12 @@ class OpenCLBackend:
         x2 = self.to_device(x2, dtype=np.float32)
         m, n = x1.shape
         perm_dev = self.to_device(inv_perm, dtype=np.int32)
-        out = cl_array.empty(self.queue, (m, 2*n), dtype=np.float32)
+        if (m == self.batch and n==self.full):
+            out = self._ring_batch_full.next()
+        elif (m == 1 and n==self.full):
+            out = self._ring_batch_full.next()
+        else:
+            out = cl_array.empty(self.queue, (m, 2*n), dtype=np.float32)
         self._concat_invperm_kernel(
             self.queue, (int(m), int(2*n)), None,
             x1.data, x2.data, perm_dev.data, out.data, np.int32(m), np.int32(n),
@@ -955,3 +1094,28 @@ class OpenCLBackend:
             x.data, bias.data, out1.data, out2.data, np.int32(m), np.int32(n), np.int32(act_type),
         )
         return out1, out2
+    
+    def fused_forward_invperm(self, v1, u2, inv_perm, s_raw, t, limit=2.0):
+        """Concatenates and applies inverse permutation to the input arrays in a fused kernel."""
+        v1 = self.to_device(v1, dtype=np.float32)
+        u2 = self.to_device(u2, dtype=np.float32)
+        s_raw = self.to_device(s_raw, dtype=np.float32)
+        t = self.to_device(t, dtype=np.float32)
+
+        m, n = v1.shape
+        perm_dev = self.to_device(inv_perm, dtype=np.int32)
+        # print(m, 2*n)
+        if (m == self.batch and n==self.full):
+            out = self._ring_batch_full.next()
+            # out = self.buffer_batch_half
+        elif (m == 1 and n==self.full):
+            out = self._ring_batch_full.next()
+            # out = self.buffer_batch_half
+        else:
+            out = cl_array.empty(self.queue, (m, 2*n), dtype=np.float32)
+        # out = cl_array.empty(self.queue, (m, 2*n), dtype=np.float32)
+        self._fused_forward_invperm_kernel(
+            self.queue, (int(m), int(2*n)), None,
+            v1.data, u2.data, perm_dev.data, s_raw.data, t.data, out.data, np.int32(m), np.int32(n), np.float32(limit),
+        )
+        return out
