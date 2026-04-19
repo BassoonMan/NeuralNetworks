@@ -18,18 +18,6 @@ class NumpyBackend:
 
     def add(self, a, b):
         return np.add(a, b)
-
-    def subtract(self, a, b):
-        return np.subtract(a, b)
-
-    def multiply(self, a, b):
-        return np.multiply(a, b)
-
-    def divide(self, a, b):
-        return np.divide(a, b)
-    
-    def sum(self, x, axis=None, keepdims=False):
-        return np.sum(x, axis=axis, keepdims=keepdims)
     
     def coupling_forward(self, u, s_raw, t, limit=2.0):
         """v = u * exp(soft_clip(s_raw, limit)) + t"""
@@ -144,15 +132,6 @@ class NumpyBackend:
         if clip > 0:
             val = clip * np.tanh(val / clip)
         return val
-    
-    def add3_clip(self, A, B, C, clip):
-        """Compute soft_clip(A + B + C, clip)."""
-        val = (np.asarray(A, dtype=np.float32)
-             + np.asarray(B, dtype=np.float32)
-             + np.asarray(C, dtype=np.float32))
-        if clip > 0:
-            val = clip * np.tanh(val / clip)
-        return val
 
     def permute_split(self, x, perm):
         """Permute columns by perm, then split into two halves."""
@@ -194,3 +173,93 @@ class NumpyBackend:
         half = st.shape[1] // 2
         s_clipped = limit * np.tanh(st[:, :half] / limit)
         return np.asarray(u) * np.exp(s_clipped) + st[:, half:]
+    
+    def subtract_divide_fuse(self, a, b, d):
+        return (np.asarray(a, dtype=np.float32) - np.asarray(b, dtype=np.float32)) / float(d)
+    
+    def subtract_divide_loss(self, a, b, d):
+        """Fused: out = (A-B)/D, returns (out, sum_of_squares_scalar)."""
+        out = (np.asarray(a, dtype=np.float32) - np.asarray(b, dtype=np.float32)) / float(d)
+        return out, float(np.sum(out * out))
+    
+    def fused_coupling_grads_concat(self, s1_outer, diff2, diff1_total, u1, st2_raw,
+                                s_limit=2.0, s_clip_limit=1.0, t_clip_limit=0.5):
+        """CPU path: build diffs_st1 and diffs_st2 in one call."""
+        s1_outer = np.asarray(s1_outer, dtype=np.float32)
+        diff2 = np.asarray(diff2, dtype=np.float32)
+        diff1_total = np.asarray(diff1_total, dtype=np.float32)
+        u1 = np.asarray(u1, dtype=np.float32)
+        st2_raw = np.asarray(st2_raw, dtype=np.float32)
+        half = s1_outer.shape[1]
+
+        # diffs_st2 left half: coupling_s_outer_grad
+        s_raw = st2_raw[:, :half]
+        th = np.tanh(s_raw / s_limit)
+        s_clipped = s_limit * th
+        clip_deriv = 1.0 - th * th
+        s2_outer = diff1_total * u1 * np.exp(s_clipped) * clip_deriv
+        if s_clip_limit > 0:
+            s2_outer = s_clip_limit * np.tanh(s2_outer / s_clip_limit)
+
+        # t portions: soft_clip
+        if t_clip_limit > 0:
+            t1_clipped = t_clip_limit * np.tanh(diff2 / t_clip_limit)
+            t2_clipped = t_clip_limit * np.tanh(diff1_total / t_clip_limit)
+        else:
+            t1_clipped = diff2.copy()
+            t2_clipped = diff1_total.copy()
+
+        diffs_st1 = np.concatenate([s1_outer, t1_clipped], axis=1)
+        diffs_st2 = np.concatenate([s2_outer, t2_clipped], axis=1)
+        return diffs_st1, diffs_st2
+    
+    def coupling_s_outer_concat(self, diff, u, st_raw, s_limit=2.0, clip_limit=2.0):
+        """Fused s_outer_grad + concat: returns (combined, s_outer)."""
+        st = np.asarray(st_raw, dtype=np.float32)
+        half = st.shape[1] // 2
+        th = np.tanh(st[:, :half] / s_limit)
+        s_clipped = s_limit * th
+        clip_deriv = 1.0 - th * th
+        s_outer = np.asarray(diff) * np.asarray(u) * np.exp(s_clipped) * clip_deriv
+        if clip_limit > 0:
+            s_outer = clip_limit * np.tanh(s_outer / clip_limit)
+        combined = np.concatenate([s_outer, np.asarray(diff, dtype=np.float32)], axis=1)
+        return combined, s_outer.copy()
+    
+    def add2_clip(self, a, b, clip):
+        """Compute soft_clip(A + B, clip)."""
+        val = np.asarray(a, dtype=np.float32) + np.asarray(b, dtype=np.float32)
+        if clip > 0:
+            val = clip * np.tanh(val / clip)
+        return val
+    
+    def matmul_bt(self, a, b_transposed):
+        """Compute A @ B^T."""
+        return np.asarray(a, dtype=np.float32) @ np.asarray(b_transposed, dtype=np.float32).T
+
+    def soft_clip(self, x, limit=2.0):
+        """limit * tanh(x / limit)"""
+        return limit * np.tanh(np.asarray(x, dtype=np.float32) / limit)
+
+    def fused_forward_invperm_merged(self, v1, u2, inv_perm, st_raw, limit=2.0):
+        """Fused: apply coupling to u2 using st_raw, then concat [v1, v2] and inverse-permute."""
+        st = np.asarray(st_raw, dtype=np.float32)
+        half = st.shape[1] // 2
+        s_clipped = limit * np.tanh(st[:, :half] / limit)
+        v2 = np.asarray(u2, dtype=np.float32) * np.exp(s_clipped) + st[:, half:]
+        combined = np.concatenate([np.asarray(v1, dtype=np.float32), v2], axis=1)
+        return combined[:, np.asarray(inv_perm, dtype=np.int32)].copy()
+
+    def coupling_input_grad_merged(self, diff, st_raw, limit=2.0):
+        """du = diff * exp(soft_clip(s_raw, limit)), where s_raw = st_raw[:, :half]."""
+        st = np.asarray(st_raw, dtype=np.float32)
+        half = st.shape[1] // 2
+        s_clipped = limit * np.tanh(st[:, :half] / limit)
+        return np.asarray(diff, dtype=np.float32) * np.exp(s_clipped)
+
+    def coupling_backward_merged(self, v, st_raw, limit=2.0):
+        """u = (v - t) * exp(-soft_clip(s_raw, limit)), where s/t come from st_raw halves."""
+        st = np.asarray(st_raw, dtype=np.float32)
+        half = st.shape[1] // 2
+        s_clipped = limit * np.tanh(st[:, :half] / limit)
+        return (np.asarray(v, dtype=np.float32) - st[:, half:]) * np.exp(-s_clipped)

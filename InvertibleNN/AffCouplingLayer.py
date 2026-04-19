@@ -61,50 +61,11 @@ class AffCouplingLayer:
         self.perm = np.random.permutation(inputLength)
         self._inv_perm = np.argsort(self.perm)
         networkInputLength = inputLength // 2
-        print(inputLength, internalLayerLength)
         self.backend = get_backend(backend, batch_size=batch_size, vector_size=inputLength, internal_width=internalLayerLength)
         self._use_device = str(backend).lower() in ("opencl", "gpu", "amd")
         if self._use_device:
             self.perm = self.backend.to_device(self.perm, dtype=np.int32)
             self._inv_perm = self.backend.to_device(self._inv_perm, dtype=np.int32)
-        # s* networks produce scale-like terms; tanh bounded outputs improve stability.
-        # self.s1 = ArrayNetwork(
-        #     networkInputLength,
-        #     internalLayers, 
-        #     [internalLayerLength] * (internalLayers - 1) + [networkInputLength], 
-        #     [[leakyReLU, leakyReLUDerivative]] * (internalLayers - 1) + [[tanh, tanhDerivative]],
-        #     isBias = True, 
-        #     random=True,
-        #     backend=backend
-        # )
-        # self.s2 = ArrayNetwork(
-        #     networkInputLength,
-        #     internalLayers, 
-        #     [internalLayerLength] * (internalLayers - 1) + [networkInputLength], 
-        #     [[leakyReLU, leakyReLUDerivative]] * (internalLayers - 1) + [[tanh, tanhDerivative]],
-        #     isBias = True, 
-        #     random=True,
-        #     backend=backend
-        # )
-        # # t* networks produce translation terms; identity output allows full shift range.
-        # self.t1 = ArrayNetwork(
-        #     networkInputLength,
-        #     internalLayers, 
-        #     [internalLayerLength] * (internalLayers - 1) + [networkInputLength], 
-        #     [[leakyReLU, leakyReLUDerivative]] * (internalLayers - 1) + [[identity, identityDerivative]], 
-        #     isBias = True, 
-        #     random=True,
-        #     backend=backend
-        # )
-        # self.t2 = ArrayNetwork(
-        #     networkInputLength,
-        #     internalLayers, 
-        #     [internalLayerLength] * (internalLayers - 1) + [networkInputLength], 
-        #     [[leakyReLU, leakyReLUDerivative]] * (internalLayers - 1) + [[identity, identityDerivative]], 
-        #     isBias = True, 
-        #     random=True,
-        #     backend=backend
-        # )
         self.st1 = ArrayNetwork(
             networkInputLength,
             internalLayers,
@@ -127,6 +88,7 @@ class AffCouplingLayer:
             backend=backend,
             batch_size=batch_size,
         )
+        self.limit = 1.5
 
         # For OpenCL training, keep cached activations on device to reduce
         # device->host copies during forward cache population.
@@ -154,17 +116,13 @@ class AffCouplingLayer:
         """Device-aware soft clip: limit * tanh(x / limit)."""
         if limit <= 0:
             return x
-        if self._use_device and hasattr(self.backend, 'soft_clip') and self.backend.is_device_array(x):
+        if self._use_device:
             return self.backend.soft_clip(x, limit)
-        if self._use_device and self.backend.is_device_array(x):
-            scaled = self.backend.divide(x, float(limit))
-            tanh_val = self.backend.apply_activation(scaled, "tanh")
-            return self.backend.multiply(float(limit), tanh_val)
         return limit * np.tanh(np.asarray(x) / limit)
 
     def _add(self, a, b):
         """Device-aware elementwise add."""
-        if self._use_device and (self.backend.is_device_array(a) or self.backend.is_device_array(b)):
+        if self._use_device:
             return self.backend.add(a, b)
         return np.add(a, b)
 
@@ -182,11 +140,11 @@ class AffCouplingLayer:
 
             # Stage 1: st2 on u2
         st2_raw = self.st2.evaluateNetwork(u2, False)  # (B, 2*half)
-        v1 = self.backend.coupling_forward_merged(u1, st2_raw, 2.0)
+        v1 = self.backend.coupling_forward_merged(u1, st2_raw, self.limit)
 
         # Stage 2: st1 on v1
         st1_raw = self.st1.evaluateNetwork(v1, False)  # (B, 2*half)
-        return self.backend.fused_forward_invperm_merged(v1, u2, self._inv_perm, st1_raw, 2.0)
+        return self.backend.fused_forward_invperm_merged(v1, u2, self._inv_perm, st1_raw, self.limit)
 
         # s2_raw = self.s2.evaluateNetwork(u2, False)
         # t2_raw = self.t2.evaluateNetwork(u2, False)
@@ -199,16 +157,18 @@ class AffCouplingLayer:
     
     def train_forward(self, x):
         # Same transform as forward(), but stores intermediate tensors used by backprop.
-        self.forward_input = x.copy()
+        self.forward_input = x
 
         u1, u2 = self.backend.permute_split(x, self.perm)
 
-        st2_raw = self.st2.evaluateNetwork(u2)   # cached
-        v1 = self.backend.coupling_forward_merged(u1, st2_raw, 2.0)
+        st2_raw = self.st2.evaluateNetwork(u2, True)   # cached
+        v1 = self.backend.coupling_forward_merged(u1, st2_raw, self.limit)
         self.forward_v1 = v1
 
-        st1_raw = self.st1.evaluateNetwork(v1)   # cached
-        return self.backend.fused_forward_invperm_merged(v1, u2, self._inv_perm, st1_raw, 2.0)
+        st1_raw = self.st1.evaluateNetwork(v1, True)   # cached
+        self.cached_st1_raw = st1_raw
+        self.cached_st2_raw = st2_raw
+        return self.backend.fused_forward_invperm_merged(v1, u2, self._inv_perm, st1_raw, self.limit)
 
         # s2_raw = self.s2.evaluateNetwork(u2)
         # t2_raw = self.t2.evaluateNetwork(u2)
@@ -226,40 +186,13 @@ class AffCouplingLayer:
         v1, v2 = self.backend.permute_split(y, self.perm)
 
         st1_raw = self.st1.evaluateNetwork(v1, False)
-        u2 = self.backend.coupling_backward_merged(v2, st1_raw, 2.0)
+        u2 = self.backend.coupling_backward_merged(v2, st1_raw, self.limit)
 
         st2_raw = self.st2.evaluateNetwork(u2, False)
-        u1 = self.backend.coupling_backward_merged(v1, st2_raw, 2.0)
+        u1 = self.backend.coupling_backward_merged(v1, st2_raw, self.limit)
         return self.backend.concat_invperm(u1, u2, self._inv_perm)
 
-        # s1_raw = self.s1.evaluateNetwork(v1, False)
-        # t1_raw = self.t1.evaluateNetwork(v1, False)
-        # u2 = self.backend.coupling_backward(v2, s1_raw, t1_raw, 2.0)
-
-        # s2_raw = self.s2.evaluateNetwork(u2, False)
-        # t2_raw = self.t2.evaluateNetwork(u2, False)
-        # u1 = self.backend.coupling_backward(v1, s2_raw, t2_raw, 2.0)
-        # return self.backend.concat_invperm(u1, u2, self._inv_perm)
-
-    # def train_backward(self, y):
-    #     # Cached inverse path used by frontpropagate variant.
-    #     y_dev = self._to_dev(y)
-    #     v1, v2 = self.backend.permute_split(y_dev, self.perm)
-    #     # y = y[:, self.perm]
-    #     # v1, v2 = np.split(y, 2, axis=1) # Split
-    #     s1_raw = self.s1.evaluateNetwork(v1)
-    #     t1_raw = self.t1.evaluateNetwork(v1)
-    #     u2 = self.backend.coupling_backward(v2, s1_raw, t1_raw, 2.0)
-
-    #     s2_raw = self.s2.evaluateNetwork(u2)
-    #     t2_raw = self.t2.evaluateNetwork(u2)
-    #     u1 = self.backend.coupling_backward(v1, s2_raw, t2_raw, 2.0)
-    #     self.back_u1 = u1
-    #     self.back_u2 = u2
-    #     x = np.concatenate((u1, u2), axis=1) # Fuse back together
-    #     return x[:, self._inv_perm] # Invert the permutation from forward
-
-    def backpropagate(self, x, learningRate, diffs, weightDecay=.001, clip=True, momentum=0.9):
+    def backpropagate(self, x, learningRate, diffs, weightDecay=0.0, clip=True, momentum=0.9):
         # Backprop is organized in 3 phases:
         #   1) Build all needed deltas/outer grads from cached forward tensors.
         #   2) Apply updates to s1/t1/s2/t2 subnetworks.
@@ -268,9 +201,18 @@ class AffCouplingLayer:
         # I have an assumption that x and diffs are on the host, at least for now.
 
         # Permute and split — avoid bouncing between host/device by just keeping on host until end.
-        u1, u2 = self.backend.permute_split(x, self.perm)
+        backend = self.backend
+        permute_split = backend.permute_split
+        coupling_s_outer_concat = backend.coupling_s_outer_concat
+        add2_clip = backend.add2_clip
+        fused_coupling_grads_concat = backend.fused_coupling_grads_concat
+        coupling_input_grad_merged = backend.coupling_input_grad_merged
+        concat_invperm = backend.concat_invperm
 
-        diff1, diff2 = self.backend.permute_split(diffs, self.perm)#np.split(diffs_perm, 2, axis=1)
+
+        u1, u2 = permute_split(x, self.perm)
+
+        diff1, diff2 = permute_split(diffs, self.perm)#np.split(diffs_perm, 2, axis=1)
 
         if clip:
             diff1 = self._soft_clip_dev(diff1, 1)
@@ -278,91 +220,31 @@ class AffCouplingLayer:
 
         # ===== PHASE 1: Compute ALL gradients (no weight updates) =====
 
-        st1_raw = self.st1.evaluateNetwork(self.forward_v1, True)  # (B, 2*half), cached
-        half = st1_raw.shape[1] // 2
+        # st1_raw = self.st1.evaluateNetwork(self.forward_v1, True)  # (B, 2*half), cached
+        st1_raw = self.cached_st1_raw
+        st2_raw = self.cached_st2_raw
+
+        # half = st1_raw.shape[1] // 2
         clip_limit = 1.0 if clip else 0.0
 
         # s-portion outer gradient (uses first half of st1_raw as s1_raw)
-        s1_outer = self.backend.coupling_s_outer_grad_merged(diff2, u2, st1_raw, s_limit=2.0, clip_limit=clip_limit)
-
-        # Concatenate the two outer gradients into one diff vector for the merged network
-        # s gets s1_outer, t gets diff2
-        combined_outer_st1 = self.backend.concat_cols(s1_outer, diff2)  # (B, 2*half)
+        combined_outer_st1, s1_outer = coupling_s_outer_concat(diff2, u2, st1_raw, s_limit=self.limit, clip_limit=clip_limit)
 
         # Single backpropDelta call replaces two
         dL_dv1 = self.st1.backpropDelta(combined_outer_st1, clip_limit)
 
-        diff1_total = self.backend.add(diff1, dL_dv1)  # was add3_clip of 3 terms
-        if clip:
-            diff1_total = self._soft_clip_dev(diff1_total, 1.0)
+        diff1_total = add2_clip(diff1, dL_dv1, 1.0 if clip else 0.0)
 
-        # s1 values — evaluate and keep on device
-        # s1_raw = self.s1.evaluateNetwork(self.forward_v1, True)
-        # clip_limit = 1.0 if clip else 0.0
-        # s1_outer = self.backend.coupling_s_outer_grad(diff2, u2, s1_raw, s_limit=2.0, clip_limit=clip_limit)
-        # dL_dv1_via_s1 = self.s1.backpropDelta(s1_outer, clip_limit)
-        # dL_dv1_via_t1 = self.t1.backpropDelta(diff2, clip_limit)
-
-        # diff1_total = self.backend.add3_clip(diff1, dL_dv1_via_s1, dL_dv1_via_t1, clip=1.0)
-
-        # # s2 values
-        # s2_raw = self.s2.evaluateNetwork(u2, True)
-        st2_raw = self.st2.evaluateNetwork(u2, True)
-
-        diffs_for_s1 = s1_outer
-        diffs_for_t1 = self._soft_clip_dev(diff2, 0.5) if clip else diff2
-        diffs_for_s2 = self.backend.coupling_s_outer_grad_merged(diff1_total, u1, st2_raw, s_limit=2.0, clip_limit=clip_limit)
-        diffs_for_t2 = self._soft_clip_dev(diff1_total, 0.5) if clip else diff1_total
+        t_clip = 0.5 if clip else 0.0
+        diffs_st1, diffs_st2 = fused_coupling_grads_concat(
+            s1_outer, diff2, diff1_total, u1, st2_raw,
+            s_limit=self.limit, s_clip_limit=clip_limit, t_clip_limit=t_clip)
 
         # ===== PHASE 2: Update ALL weights =====
-        # Merged: 2 update calls
-        diffs_st1 = self.backend.concat_cols(diffs_for_s1, diffs_for_t1)  # (B, 2*half)
         self.st1.updateNetworkGeneralizedDelta(self.forward_v1, diffs_st1, learningRate, weightDecay, momentum)
-
-        diffs_st2 = self.backend.concat_cols(diffs_for_s2, diffs_for_t2)
         self.st2.updateNetworkGeneralizedDelta(u2, diffs_st2, learningRate, weightDecay, momentum)
 
-        # self.s1.updateNetworkGeneralizedDelta(self.forward_v1, diffs_for_s1, learningRate, weightDecay, momentum)
-        # self.t1.updateNetworkGeneralizedDelta(self.forward_v1, diffs_for_t1, learningRate, weightDecay, momentum)
-        # self.s2.updateNetworkGeneralizedDelta(u2, diffs_for_s2, learningRate, weightDecay, momentum)
-        # self.t2.updateNetworkGeneralizedDelta(u2, diffs_for_t2, learningRate, weightDecay, momentum)
-
         # ===== PHASE 3: Input grads for multi-layer =====
-        du1 = self.backend.coupling_input_grad_merged(diff1_total, st2_raw, 2.0)
-        du2 = self.backend.coupling_input_grad_merged(diff2, st1_raw, 2.0)
-        return self.backend.concat_invperm(du1, du2, self._inv_perm)
-        # du1 = self.backend.coupling_input_grad(diff1_total, s2_raw, 2.0)
-        # du2 = self.backend.coupling_input_grad(diff2, s1_raw, 2.0)
-        # return self.backend.concat_invperm(du1, du2, self._inv_perm)
-        
-    # def frontpropagate(self, y, learningRate, diffs, weightDecay = .001):
-    #     # Alternative direction update path used in some experiments.
-    #     # diffs: [(u1-target), (u2-target)]
-    #     y = y[:, self.perm]
-    #     v1, v2 = np.split(y, 2, axis=1) # Split
-    #     diffs_perm = diffs[:, self.perm]
-    #     diff1, diff2 = np.split(diffs_perm, 2, axis=1)
-    #     diff1 = soft_clip(diff1, 1)
-    #     diff2 = soft_clip(diff2, 1)
-
-    #     s1_raw = self.s1.evaluateNetwork(v1, True)
-    #     s1_clipped = soft_clip(s1_raw, 2)
-    #     s1_clip_deriv = 1 - np.tanh(s1_raw / 2.0) ** 2
-
-    #     diffs_for_s1 = soft_clip(-diff2 * self.back_u2 * s1_clip_deriv, 1)
-    #     self.s1.updateNetworkGeneralizedDelta(v1, diffs_for_s1, learningRate, weightDecay)
-
-    #     self.t1.evaluateNetwork(v1, True)
-    #     diffs_for_t1 = soft_clip(-diff2 * np.exp(-s1_clipped), .5)
-    #     self.t1.updateNetworkGeneralizedDelta(v1, diffs_for_t1, learningRate, weightDecay)
-
-    #     s2_raw = self.s2.evaluateNetwork(self.back_u2, True)
-    #     s2_clipped = soft_clip(s2_raw, 2)
-    #     s2_clip_deriv = 1 - np.tanh(s2_raw / 2.0) ** 2
-
-    #     diffs_for_s2 = soft_clip(-diff1 * self.back_u1 * s2_clip_deriv, 1)
-    #     self.s2.updateNetworkGeneralizedDelta(self.back_u2, diffs_for_s2, learningRate, weightDecay)
-
-    #     self.t2.evaluateNetwork(self.back_u2, True)
-    #     diffs_for_t2 = soft_clip(-diff1 * np.exp(-s2_clipped), 0.5)
-    #     self.t2.updateNetworkGeneralizedDelta(self.back_u2, diffs_for_t2, learningRate, weightDecay)
+        du1 = coupling_input_grad_merged(diff1_total, st2_raw, self.limit)
+        du2 = coupling_input_grad_merged(diff2, st1_raw, self.limit)
+        return concat_invperm(du1, du2, self._inv_perm)
