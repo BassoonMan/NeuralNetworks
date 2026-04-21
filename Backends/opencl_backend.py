@@ -628,9 +628,68 @@ class OpenCLBackend:
         out[i] = val;
     }
 
+    // Backward coupling outer gradient: u = (v - t) * exp(-s_clip)
+    // Left half  (col < half): soft_clip(-diff * u * s_clip_deriv, s_clip_limit)
+    // Right half (col >= half): soft_clip(-diff * exp(-s_clip), t_clip_limit)
+    __kernel void coupling_backward_outer_concat_f32(
+        __global const float* diff,      // (M, half_N)
+        __global const float* U,         // (M, half_N)
+        __global const float* ST_raw,    // (M, 2*half_N)
+        __global float* out,             // (M, 2*half_N)
+        const float s_limit,
+        const float s_clip_limit,
+        const float t_clip_limit,
+        const int M,
+        const int half_N)
+    {
+        const int row = get_global_id(0);
+        const int col = get_global_id(1);
+        const int full_N = 2 * half_N;
+        if (row >= M || col >= full_N) return;
+
+        const int out_idx = row * full_N + col;
+
+        if (col < half_N) {
+            const int half_idx = row * half_N + col;
+            float s_raw_val = ST_raw[row * full_N + col];
+            float th = tanh(s_raw_val / s_limit);
+            float clip_deriv = 1.0f - th * th;
+            float val = -diff[half_idx] * U[half_idx] * clip_deriv;
+            if (s_clip_limit > 0.0f) {
+                val = s_clip_limit * tanh(val / s_clip_limit);
+            }
+            out[out_idx] = val;
+        } else {
+            const int half_idx = row * half_N + (col - half_N);
+            float s_raw_val = ST_raw[row * full_N + (col - half_N)];
+            float s_clipped = s_limit * tanh(s_raw_val / s_limit);
+            float val = -diff[half_idx] * exp(-s_clipped);
+            if (t_clip_limit > 0.0f) {
+                val = t_clip_limit * tanh(val / t_clip_limit);
+            }
+            out[out_idx] = val;
+        }
+    }
+
+    // Backward coupling input gradient: dv = diff * exp(-s_clip)
+    __kernel void coupling_backward_input_grad_merged_f32(
+        __global const float* diff,
+        __global const float* ST_raw,
+        __global float* du,
+        const float limit,
+        const int N,
+        const int cols)
+    {
+        const int i = get_global_id(0);
+        if (i >= N) return;
+        const int row = i / (cols / 2);
+        float s_clipped = limit * tanh(ST_raw[row * cols + (i % (cols / 2))] / limit);
+        du[i] = diff[i] * exp(-s_clipped);
+    }
+
     """
 
-    def __init__(self, batch_size=128, vector_size=64, internal_width=64, preferred_device_type="gpu"):
+    def __init__(self, batch_size=128, vector_size=64, internal_width=64, preferred_device_type="gpu", coupling_layers=10, internal_network_layers=2):
         # Prefer GPU when available; fallback selection is handled in factory.
         if cl is None or cl_array is None:
             raise RuntimeError("pyopencl is not available")
@@ -709,6 +768,8 @@ class OpenCLBackend:
         self._fused_coupling_grads_concat_kernel = cl.Kernel(self._program, "fused_coupling_grads_concat_f32")
         self._coupling_s_outer_concat_kernel = cl.Kernel(self._program, "coupling_s_outer_concat_f32")
         self._add2_clip_kernel = cl.Kernel(self._program, "add2_clip_f32")
+        self._coupling_backward_outer_concat_kernel = cl.Kernel(self._program, "coupling_backward_outer_concat_f32")
+        self._coupling_backward_input_grad_merged_kernel = cl.Kernel(self._program, "coupling_backward_input_grad_merged_f32")
         self._has_pyclblast = pyclblast is not None
         # If CLBlast fails once on this runtime/device, disable and fallback to
         # custom kernel to avoid repeated exception overhead.
@@ -719,13 +780,15 @@ class OpenCLBackend:
 
         # Initializing buffers to reused space
         _RING_N = 16  # max simultaneously live buffers of any one shape
+        n_subnets = coupling_layers * 2
+        n_hidden = internal_network_layers - 1
 
-        self._ring_batch_full   = _DeviceBufferRing(self.queue, (self.batch, self.full),   _RING_N*2)
-        self._ring_batch_half   = _DeviceBufferRing(self.queue, (self.batch, self.half),   _RING_N)
+        self._ring_batch_full   = _DeviceBufferRing(self.queue, (self.batch, self.full),   n_subnets * 2 + coupling_layers + 16)
+        self._ring_batch_half   = _DeviceBufferRing(self.queue, (self.batch, self.half),   coupling_layers * 3 + 16)
         self._ring_single_full  = _DeviceBufferRing(self.queue, (1,          self.full),   _RING_N)
         self._ring_single_half  = _DeviceBufferRing(self.queue, (1,          self.half),   _RING_N)
         self._ring_batch_hidden = _DeviceBufferRing(self.queue, (self.batch, self.hidden), _RING_N)
-        self._ring_batch_hiddenx2 = _DeviceBufferRing(self.queue, (self.batch, self.hidden * 2), 6*_RING_N)
+        self._ring_batch_hiddenx2 = _DeviceBufferRing(self.queue, (self.batch, self.hidden * 2), n_subnets * (3 * n_hidden))
         self._ring_single_hidden= _DeviceBufferRing(self.queue, (1,          self.hidden), _RING_N)
         self._ring_single_hiddenx2= _DeviceBufferRing(self.queue, (1,          self.hidden * 2), _RING_N)
         self._ring_batch_batch  = _DeviceBufferRing(self.queue, (self.batch, self.batch),  _RING_N*2)
@@ -914,6 +977,21 @@ class OpenCLBackend:
         k = cl.Kernel(self._program, "add2_clip_f32")
         k.set_arg(4, self._c_bxhalf)  # N = batch * half
         self._pb_add2_clip_half = k
+
+        # coupling_backward_outer_concat_f32(diff, U, ST, out, s_limit, s_clip, t_clip, M, half_N)
+        k = cl.Kernel(self._program, "coupling_backward_outer_concat_f32")
+        k.set_arg(4, self._c_limit2)       # s_limit always 2.0
+        # args 5 (s_clip_limit), 6 (t_clip_limit) set at call time
+        k.set_arg(7, self._c_batch)
+        k.set_arg(8, self._c_half)
+        self._pb_bwd_outer_concat = k
+
+        # coupling_backward_input_grad_merged_f32(diff, ST, du, limit, N, cols)
+        k = cl.Kernel(self._program, "coupling_backward_input_grad_merged_f32")
+        k.set_arg(3, self._c_limit2)
+        k.set_arg(4, self._c_bxhalf)       # N = batch*half
+        k.set_arg(5, self._c_full)          # cols = st_raw width
+        self._pb_bwd_input_grad = k
 
     def _cached_f32(self, val):
         """Return a cached np.float32 for a given Python float."""
@@ -1655,5 +1733,56 @@ class OpenCLBackend:
             self.queue, (int(total),), None,
             ad.data, bd.data, out.data,
             np.float32(clip), np.int32(total),
+        )
+        return out
+
+    def coupling_backward_outer_concat(self, diff, u, st_raw, s_limit=2.0, s_clip_limit=1.0, t_clip_limit=0.5):
+        """Outer gradient for backward coupling u = (v - t) * exp(-s_clip).
+        Returns combined (M, 2*half) = [s_outer | t_outer]."""
+        diff = self.to_device(diff, dtype=np.float32)
+        u = self.to_device(u, dtype=np.float32)
+        st_raw = self.to_device(st_raw, dtype=np.float32)
+        m, n = u.shape  # n = half
+        if m == self.batch and n == self.half:
+            out = self._ring_batch_full.next()
+            k = self._pb_bwd_outer_concat
+            k.set_arg(0, diff.data)
+            k.set_arg(1, u.data)
+            k.set_arg(2, st_raw.data)
+            k.set_arg(3, out.data)
+            k.set_arg(5, self._cached_f32(s_clip_limit))
+            k.set_arg(6, self._cached_f32(t_clip_limit))
+            cl.enqueue_nd_range_kernel(self.queue, k, self._gs_b_full, None)
+            return out
+        # Generic fallback
+        out = cl_array.empty(self.queue, (m, 2 * n), dtype=np.float32)
+        self._coupling_backward_outer_concat_kernel(
+            self.queue, (int(m), int(2 * n)), None,
+            diff.data, u.data, st_raw.data, out.data,
+            np.float32(s_limit), np.float32(s_clip_limit), np.float32(t_clip_limit),
+            np.int32(m), np.int32(n),
+        )
+        return out
+
+    def coupling_backward_input_grad_merged(self, diff, st_raw, limit=2.0):
+        """dv = diff * exp(-soft_clip(s_raw, limit)), where s_raw = st_raw[:, :half]."""
+        dd = self.to_device(diff, dtype=np.float32)
+        std = self.to_device(st_raw, dtype=np.float32)
+        m, n = dd.shape
+        if m == self.batch and n == self.half:
+            out = self._ring_batch_half.next()
+            k = self._pb_bwd_input_grad
+            k.set_arg(0, dd.data)
+            k.set_arg(1, std.data)
+            k.set_arg(2, out.data)
+            cl.enqueue_nd_range_kernel(self.queue, k, self._gs_bxhalf, None)
+            return out
+        out = cl_array.empty(self.queue, dd.shape, dtype=np.float32)
+        total = dd.size
+        cols = st_raw.shape[1]
+        self._coupling_backward_input_grad_merged_kernel(
+            self.queue, (int(total),), None,
+            dd.data, std.data, out.data,
+            np.float32(limit), np.int32(total), np.int32(cols),
         )
         return out

@@ -5,7 +5,7 @@ from .opencl_backend import OpenCLBackend
 _BACKEND_SINGLETONS = {}
 
 
-def get_backend(name="cpu", batch_size=128, vector_size=784, internal_width=64):
+def get_backend(name="cpu", batch_size=128, vector_size=784, internal_width=64, coupling_layers=10, internal_network_layers=2):
     normalized = (name or "cpu").strip().lower()
     if normalized in ("cpu", "numpy"):
         backend = _BACKEND_SINGLETONS.get("cpu")
@@ -18,7 +18,7 @@ def get_backend(name="cpu", batch_size=128, vector_size=784, internal_width=64):
         if backend is not None:
             return backend
         try:
-            backend = OpenCLBackend(batch_size, vector_size, internal_width, preferred_device_type="gpu")
+            backend = OpenCLBackend(batch_size, vector_size, internal_width, preferred_device_type="gpu", coupling_layers=coupling_layers, internal_network_layers=internal_network_layers)
             _BACKEND_SINGLETONS["opencl"] = backend
             return backend
         except Exception as exc:

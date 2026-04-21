@@ -20,18 +20,22 @@ class InvertibleNeuralNetwork:
         # Stack of affine coupling layers. Composition remains invertible.
         self.layers = []
         for i in range(layers):
-            self.layers.append(AffCouplingLayer(in_out_length, internalLayers, internalLayerLength, backend=backend, batch_size=batch_size))
+            self.layers.append(AffCouplingLayer(in_out_length, internalLayers, internalLayerLength, backend=backend, batch_size=batch_size, coupling_layers=layers))
         # Top-level step profiler (minibatch granularity). This I think just keeps track of total timings.
         self._profiler_enabled = False
         self._profile_totals = {
             "train_forward": 0.0,
             "backpropagate": 0.0,
+            "train_backward": 0.0,
+            "frontpropagate": 0.0,
             "loss_compute": 0.0,
             "train_step_total": 0.0,
         }
         self._profile_steps = 0
         # print(batch_size, vector_size, internalLayerLength)
-        self.backend = get_backend(backend, batch_size=batch_size, vector_size=vector_size, internal_width=internalLayerLength*2)
+        self.backend = get_backend(backend, batch_size=batch_size, vector_size=vector_size, internal_width=internalLayerLength*2,
+                           coupling_layers=layers, 
+                           internal_network_layers=internalLayers)
         self._prev_loss_value = 0.0
         self._pending_loss = None
         self._staging_inputs = np.empty((batch_size, vector_size), dtype=np.float32)
@@ -238,12 +242,17 @@ class InvertibleNeuralNetwork:
         
         current_diffs = self.backend.to_device(diffs)
         for layer in reversed(self.layers):
-            input_diffs = layer.backpropagate(layer.forward_input, learningRate, current_diffs, momentum=momentum)
+            input_diffs = layer.backpropagate(layer.forward_input, learningRate, current_diffs, momentum=momentum, weightDecay=0.0001)
             current_diffs = input_diffs
 
-    def frontpropagate(self, output, diffs, learningRate):
+    def frontpropagate(self, diffs, learningRate, momentum=0.9):
+        # Propagate dL/dReconstruction forward across coupling stack.
+        # Layers are iterated in forward order (0..N) since train_backward
+        # processed them in reverse order (N..0).
+        current_diffs = self.backend.to_device(diffs)
         for layer in self.layers:
-            layer.frontpropagate(output, learningRate, diffs)
+            output_diffs = layer.frontpropagate(layer.backward_input, learningRate, current_diffs, momentum=momentum, weightDecay=0.0001)
+            current_diffs = output_diffs
     
     def train_sample(self, inputs, targets, learningRate):
         """Train on a single sample and return loss"""
@@ -276,22 +285,33 @@ class InvertibleNeuralNetwork:
         t1 = time.perf_counter() if self._profiler_enabled else 0.0
         
 
+        # t2 = time.perf_counter() if self._profiler_enabled else 0.0
+        # calc_inputs = self.train_backward(batch_targets)  # stays on device
+        # t3 = time.perf_counter() if self._profiler_enabled else 0.0
+
         diffs, partial_sums_dev = self.backend.subtract_divide_loss(batch_targets, calc_outputs, float(n_samples))
         self._pending_loss = partial_sums_dev
-        t2 = time.perf_counter() if self._profiler_enabled else 0.0
+        t4 = time.perf_counter() if self._profiler_enabled else 0.0
         self.backpropagate(diffs, learningRate, momentum=momentum)
-        t3 = time.perf_counter() if self._profiler_enabled else 0.0
+        t5 = time.perf_counter() if self._profiler_enabled else 0.0
+
+        # diffs, partial_sums_dev = self.backend.subtract_divide_loss(batch_inputs, calc_inputs, float(n_samples))
+        # t6 = time.perf_counter() if self._profiler_enabled else 0.0
+        # self.frontpropagate(diffs, .5*learningRate, momentum=momentum * momentum)
+        # t7 = time.perf_counter() if self._profiler_enabled else 0.0
 
         loss = 0.5 * float(n_samples) * self._prev_loss_value  
         self._prev_loss_value = float(np.sum(self.backend.to_host(self._pending_loss)))
 
 
         if self._profiler_enabled:
-            t4 = time.perf_counter()
+            t8 = time.perf_counter()
             self._profile_totals["train_forward"] += (t1 - t0)
-            self._profile_totals["backpropagate"] += (t3 - t2)
-            self._profile_totals["loss_compute"] += (t4 - t3)
-            self._profile_totals["train_step_total"] += (t4 - step_t0)
+            # self._profile_totals["backpropagate"] += (t3 - t2)
+            self._profile_totals["loss_compute"] += (t8 - t5)
+            self._profile_totals["backpropagate"] += (t4 - t5)
+            # self._profile_totals["frontpropagate"] += (t7 - t6)
+            self._profile_totals["train_step_total"] += (t8 - step_t0)
             self._profile_steps += 1
 
         return loss
@@ -345,13 +365,13 @@ if __name__ == "__main__":
 
     backend = "opencl"  # "cpu" or "opencl"
     vector_size = 28*28
-    internal_network_layers = 3
-    coupling_layers = 6
-    hidden_width = 256
+    internal_network_layers = 4
+    coupling_layers = 10
+    hidden_width = 1024
     assert vector_size % 2 == 0, "vector_size must be even for coupling split"
 
     initial_lr = 0.001
-    min_lr = 0.0001
+    min_lr = 0.00003
     output_error_track = []
     startTime = time.perf_counter()
     learnRate = 0
@@ -403,7 +423,12 @@ if __name__ == "__main__":
 
         import math
         import msvcrt
-        
+        patience = 10
+        plateau_factor = 0.5
+        best_loss = float('inf')
+        plateau_counter = 0
+
+        # Inside epoch loop, after computing epoch_error:
         # Main training loop:
         #   - shuffle data
         #   - iterate minibatches with cosine LR + momentum schedule
@@ -434,7 +459,7 @@ if __name__ == "__main__":
                 # learnRate = min_lr + 0.5 * (initial_lr - min_lr) * (
                 #     1 + math.cos(math.pi * iteration / total_iterations))
                 
-                current_momentum = min(0.75, 0.5 + 0.25 * min(1.0, iteration / cosine_iterations))
+                current_momentum = min(0.65, 0.5 + 0.25 * min(1.0, iteration / cosine_iterations))
 
                 batch_loss = inn.train_minibatch(batch_samples, learnRate, momentum=current_momentum)
                 if not np.isfinite(batch_loss):
@@ -458,6 +483,16 @@ if __name__ == "__main__":
             
             epoch_error /= samples_per_epoch
             output_error_track.append(epoch_error)
+
+            # if epoch_error < best_loss * 0.9995:
+            #     best_loss = epoch_error
+            #     plateau_counter = 0
+            # else:
+            #     plateau_counter += 1
+            #     if plateau_counter >= patience:
+            #         min_lr *= plateau_factor
+            #         plateau_counter = 0
+            #         print(f"Plateau: LR floor reduced to {min_lr:.7f}")
             
             if (epoch + 1) % 1 == 0:
                 step_profile = inn.get_step_profile(reset=False)

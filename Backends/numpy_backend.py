@@ -263,3 +263,31 @@ class NumpyBackend:
         half = st.shape[1] // 2
         s_clipped = limit * np.tanh(st[:, :half] / limit)
         return (np.asarray(v, dtype=np.float32) - st[:, half:]) * np.exp(-s_clipped)
+
+    def coupling_backward_outer_concat(self, diff, u, st_raw, s_limit=2.0, s_clip_limit=1.0, t_clip_limit=0.5):
+        """Outer gradient for backward coupling u = (v - t) * exp(-s_clip).
+        Returns combined (B, 2*half) where:
+          left  = soft_clip(-diff * u * s_clip_deriv, s_clip_limit)
+          right = soft_clip(-diff * exp(-s_clip), t_clip_limit)
+        """
+        diff = np.asarray(diff, dtype=np.float32)
+        u = np.asarray(u, dtype=np.float32)
+        st = np.asarray(st_raw, dtype=np.float32)
+        half = st.shape[1] // 2
+        th = np.tanh(st[:, :half] / s_limit)
+        s_clipped = s_limit * th
+        clip_deriv = 1.0 - th * th
+        s_outer = -diff * u * clip_deriv
+        if s_clip_limit > 0:
+            s_outer = s_clip_limit * np.tanh(s_outer / s_clip_limit)
+        t_outer = -diff * np.exp(-s_clipped)
+        if t_clip_limit > 0:
+            t_outer = t_clip_limit * np.tanh(t_outer / t_clip_limit)
+        return np.concatenate([s_outer, t_outer], axis=1)
+
+    def coupling_backward_input_grad_merged(self, diff, st_raw, limit=2.0):
+        """dv = diff * exp(-soft_clip(s_raw, limit)), where s_raw = st_raw[:, :half]."""
+        st = np.asarray(st_raw, dtype=np.float32)
+        half = st.shape[1] // 2
+        s_clipped = limit * np.tanh(st[:, :half] / limit)
+        return np.asarray(diff, dtype=np.float32) * np.exp(-s_clipped)
