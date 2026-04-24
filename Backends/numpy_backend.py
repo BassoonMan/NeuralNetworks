@@ -1,6 +1,9 @@
 import numpy as np
 
 
+_T_SCALE = np.float32(1.5)
+
+
 class NumpyBackend:
     name = "cpu"
 
@@ -82,6 +85,7 @@ class NumpyBackend:
         elif act_type == 3:
             half = val.shape[1] // 2
             val[:, :half] = np.tanh(val[:, :half])
+            val[:, half:] = _T_SCALE * np.tanh(val[:, half:] / _T_SCALE)
         return val
     
     def fused_sgd_update(self, weights, velocity, gradient, lr, momentum, decay_factor):
@@ -89,10 +93,12 @@ class NumpyBackend:
         velocity[:] = momentum * velocity + gradient
         weights[:] = decay_factor * weights + lr * velocity
 
-    def fused_sgd_bias_update(self, bias, velocity, gradient, lr, momentum):
-        """In-place: v = mom*v + g; b = b + lr*v"""
+    def fused_sgd_bias_update(self, bias, velocity, gradient, lr, momentum, decay_factor=1.0, clip_limit=0.0):
+        """In-place: v = mom*v + g; b = decay*b + lr*v"""
         velocity[:] = momentum * velocity + gradient
-        bias[:] = bias + lr * velocity
+        bias[:] = decay_factor * bias + lr * velocity
+        if clip_limit > 0:
+            np.clip(bias, -clip_limit, clip_limit, out=bias)
 
     def matmul_at_b_clip(self, a, b, clip):
         """Compute soft_clip(A^T @ B, clip)."""
@@ -124,8 +130,10 @@ class NumpyBackend:
         elif act_type == 3:
             half = pre.shape[1] // 2
             d = np.ones_like(pre, dtype=np.float32)
-            t = np.tanh(pre[:, :half])
-            d[:, :half] = (1.0 - t * t).astype(np.float32)
+            ts = np.tanh(pre[:, :half])
+            d[:, :half] = (1.0 - ts * ts).astype(np.float32)
+            tt = np.tanh(pre[:, half:] / _T_SCALE)
+            d[:, half:] = (1.0 - tt * tt).astype(np.float32)
         else:                    # identity derivative
             d = np.ones_like(pre, dtype=np.float32)
         val = inp * d
@@ -162,6 +170,7 @@ class NumpyBackend:
             half = pre_act.shape[1] // 2
             post_act = pre_act.copy()
             post_act[:, :half] = np.tanh(post_act[:, :half])
+            post_act[:, half:] = _T_SCALE * np.tanh(post_act[:, half:] / _T_SCALE)
         else:                    # identity
             post_act = pre_act.copy()
         return pre_act, post_act
@@ -173,9 +182,6 @@ class NumpyBackend:
         half = st.shape[1] // 2
         s_clipped = limit * np.tanh(st[:, :half] / limit)
         return np.asarray(u) * np.exp(s_clipped) + st[:, half:]
-    
-    def subtract_divide_fuse(self, a, b, d):
-        return (np.asarray(a, dtype=np.float32) - np.asarray(b, dtype=np.float32)) / float(d)
     
     def subtract_divide_loss(self, a, b, d):
         """Fused: out = (A-B)/D, returns (out, sum_of_squares_scalar)."""
@@ -291,3 +297,17 @@ class NumpyBackend:
         half = st.shape[1] // 2
         s_clipped = limit * np.tanh(st[:, :half] / limit)
         return np.asarray(diff, dtype=np.float32) * np.exp(-s_clipped)
+    
+    def weighted_loss_diffs(self, inputs, targets, outputs, alpha, beta, inv_n):
+        inputs  = np.asarray(inputs,  dtype=np.float32)
+        targets = np.asarray(targets, dtype=np.float32)
+        outputs = np.asarray(outputs, dtype=np.float32)
+        residual = targets - outputs
+        erase = np.clip(inputs - targets, 0.0, 1.0)
+        add_v = np.clip(targets - inputs, 0.0, 1.0)
+        weights = 0.5 * (1.0 - np.clip(erase + add_v, 0.0, 1.0)) + (1.0 + alpha) * (erase + add_v)
+        weights /= np.mean(weights, axis=1, keepdims=True) + 1e-8
+        fwd_coeff = (1.0 - beta) + beta * weights
+        train_diffs = (residual * fwd_coeff * inv_n).astype(np.float32)
+        row_loss = (0.5 * np.sum(fwd_coeff * residual * residual, axis=1)).astype(np.float32)
+        return train_diffs, row_loss

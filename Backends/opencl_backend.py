@@ -103,12 +103,17 @@ class OpenCLBackend:
         __global const float* ST_raw,
         __global float* U,
         const float limit,
-        const int N)
+        const int N,
+        const int cols)
     {
         const int i = get_global_id(0);
         if (i >= N) return;
-        float s_clipped = limit * tanh(ST_raw[i] / limit);
-        U[i] = (V[i] - ST_raw[i + N]) * exp(-s_clipped);
+        const int half_cols = cols / 2;
+        const int row = i / half_cols;
+        const int col = i % half_cols;
+        const int st_base = row * cols;
+        float s_clipped = limit * tanh(ST_raw[st_base + col] / limit);
+        U[i] = (V[i] - ST_raw[st_base + half_cols + col]) * exp(-s_clipped);
     }
 
     // Input gradient: du = diff * exp(soft_clip(s_raw, limit))
@@ -162,7 +167,7 @@ class OpenCLBackend:
     }
     // Fused bias-add + activation in a single pass.
     // Y[row, col] = activation(X[row, col] + B[col])
-    // act_type: 0 = identity, 1 = leakyReLU (alpha=0.01), 2 = tanh
+    // act_type: 0 = identity, 1 = leakyReLU (alpha=0.01), 2 = tanh, 3 = split_tanh_identity
     __kernel void fused_bias_act_f32(
         __global const float* X,       // (M, N) matmul output
         __global const float* B,       // (1, N) bias row
@@ -183,7 +188,7 @@ class OpenCLBackend:
         } else if (act_type == 2) {   // tanh
             val = tanh(val);
         } else if (act_type == 3) {
-            val = (col < N / 2) ? tanh(val) : val;
+            val = (col < N / 2) ? tanh(val) : 1.5f * tanh(val / 1.5f);
         }
         // act_type == 0: identity (no-op)
 
@@ -197,6 +202,8 @@ class OpenCLBackend:
         __global const float* G,
         const float lr,
         const float momentum,
+        const float decay_factor,
+        const float weight_clip_limit,
         const int N)
     {
         const int i = get_global_id(0);
@@ -204,7 +211,11 @@ class OpenCLBackend:
 
         float v = momentum * V[i] + G[i];
         V[i] = v;
-        B[i] = B[i] + lr * v;
+        float b_new = decay_factor * B[i] + lr * v;
+        if (weight_clip_limit > 0.0f) {
+            b_new = fmax(fmin(b_new, weight_clip_limit), -weight_clip_limit);
+        }
+        B[i] = b_new;
     }
     // C[M, N] = soft_clip(A^T[M, K] @ B[K, N], limit)
     // A stored as [K, M], so A^T[m, k] = A[k*M + m]
@@ -296,9 +307,16 @@ class OpenCLBackend:
         } else if (act_type == 2) {    // tanh derivative
             float t = tanh(preact[i]);
             d = 1.0f - t * t;
+        // Replace at line 309:
         } else if (act_type == 3) {
             int col = i % cols;
-            d = (col < cols / 2) ? (1.0f - tanh(preact[i]) * tanh(preact[i])) : 1.0f;
+            if (col < cols / 2) {
+                float ts = tanh(preact[i]);
+                d = 1.0f - ts * ts;
+            } else {
+                float tt = tanh(preact[i] / 1.5f);
+                d = 1.0f - tt * tt;
+            }
         } else {                       // identity derivative
             d = 1.0f;
         }
@@ -398,7 +416,7 @@ class OpenCLBackend:
         } else if (act_type == 2) {
             val = tanh(val);
         } else if (act_type == 3) {
-            val = (col < N / 2) ? tanh(val) : val;
+            val = (col < N / 2) ? tanh(val) : 1.5f * tanh(val / 1.5f);
         }
 
 
@@ -483,6 +501,7 @@ class OpenCLBackend:
         const float lr,
         const float momentum,
         const float decay_factor,
+        const float weight_clip_limit,
         const int M,
         const int N)
     {
@@ -493,6 +512,9 @@ class OpenCLBackend:
         float v = momentum * V[i] + G[i];
         V[i] = v;
         float w_new = decay_factor * W[i] + lr * v;
+        if (weight_clip_limit > 0.0f) {
+            w_new = fmax(fmin(w_new, weight_clip_limit), -weight_clip_limit);
+        }
         W[i] = w_new;
 
         // Write into transpose position simultaneously
@@ -687,6 +709,97 @@ class OpenCLBackend:
         du[i] = diff[i] * exp(-s_clipped);
     }
 
+    // Fused weighted loss + train_diffs.
+    // One work-group per sample row, local_size = 256.
+    // Pass 1: accumulate unnormalized weights → row mean via local reduction.
+    // Pass 2: normalize weights, write train_diffs, accumulate weighted SSE.
+    __kernel void weighted_loss_diffs_f32(
+        __global const float* inputs,    // (B, D)
+        __global const float* targets,   // (B, D)
+        __global const float* outputs,   // (B, D) — INN forward output
+        __global float* train_diffs,     // (B, D) — output
+        __global float* row_loss,        // (B,)   — 0.5 * weighted per-sample SSE
+        const float alpha,               // min(1.0, epoch/6.0)
+        const float beta,                // min(0.3, epoch/20.0)
+        const float inv_n,               // 1.0 / n_samples
+        const int B,
+        const int D)
+    {
+        const int row = get_group_id(0);
+        const int lid = get_local_id(0);
+        __local float scratch[256];
+
+        if (row >= B) return;
+
+        // ---- Pass 1: sum of unnormalized weights for this row ----
+        float local_w = 0.0f;
+        for (int col = lid; col < D; col += 256) {
+            int i = row * D + col;
+            float inp   = inputs[i];
+            float tgt   = targets[i];
+            float erase = clamp(inp - tgt, 0.0f, 1.0f);
+            float add_v = clamp(tgt - inp, 0.0f, 1.0f);
+            float keep  = 1.0f - clamp(erase + add_v, 0.0f, 1.0f);
+            local_w += 0.5f * keep + (1.0f + alpha) * (erase + add_v);
+        }
+        scratch[lid] = local_w;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int stride = 128; stride > 0; stride >>= 1) {
+            if (lid < stride) scratch[lid] += scratch[lid + stride];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        // row_mean_w = mean(unnormalized weights) + epsilon
+        float row_mean_w = scratch[0] / (float)D + 1e-8f;
+
+        // ---- Pass 2: normalize, write train_diffs, accumulate SSE ----
+        float local_sse = 0.0f;
+        for (int col = lid; col < D; col += 256) {
+            int i = row * D + col;
+            float inp   = inputs[i];
+            float tgt   = targets[i];
+            float out_v = outputs[i];
+            float erase = clamp(inp - tgt, 0.0f, 1.0f);
+            float add_v = clamp(tgt - inp, 0.0f, 1.0f);
+            float keep  = 1.0f - clamp(erase + add_v, 0.0f, 1.0f);
+            float w          = (0.5f * keep + (1.0f + alpha) * (erase + add_v)) / row_mean_w;
+            float residual   = tgt - out_v;
+            float fwd_coeff  = (1.0f - beta) + beta * w;
+            train_diffs[i]   = residual * fwd_coeff * inv_n;
+            local_sse       += fwd_coeff * residual * residual;
+        }
+        scratch[lid] = local_sse;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int stride = 128; stride > 0; stride >>= 1) {
+            if (lid < stride) scratch[lid] += scratch[lid + stride];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0)
+            row_loss[row] = 0.5f * scratch[0];
+    }
+
+    __kernel void reduce_sum_f32(
+        __global const float* in,
+        __global float* out,
+        const int N)
+    {
+        const int lid = get_local_id(0);
+        const int group_size = get_local_size(0);
+        __local float scratch[256];
+
+        float acc = 0.0f;
+        for (int i = lid; i < N; i += group_size) {
+            acc += in[i];
+        }
+        scratch[lid] = acc;
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int stride = group_size >> 1; stride > 0; stride >>= 1) {
+            if (lid < stride) scratch[lid] += scratch[lid + stride];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0) out[0] = scratch[0];
+    }
+
     """
 
     def __init__(self, batch_size=128, vector_size=64, internal_width=64, preferred_device_type="gpu", coupling_layers=10, internal_network_layers=2):
@@ -770,6 +883,8 @@ class OpenCLBackend:
         self._add2_clip_kernel = cl.Kernel(self._program, "add2_clip_f32")
         self._coupling_backward_outer_concat_kernel = cl.Kernel(self._program, "coupling_backward_outer_concat_f32")
         self._coupling_backward_input_grad_merged_kernel = cl.Kernel(self._program, "coupling_backward_input_grad_merged_f32")
+        self._weighted_loss_diffs_kernel = cl.Kernel(self._program, "weighted_loss_diffs_f32")
+        self._reduce_sum_kernel = cl.Kernel(self._program, "reduce_sum_f32")
         self._has_pyclblast = pyclblast is not None
         # If CLBlast fails once on this runtime/device, disable and fallback to
         # custom kernel to avoid repeated exception overhead.
@@ -796,11 +911,10 @@ class OpenCLBackend:
         # These don't need buffer rings since they are used infrequently.
         self.matmulatb_half_hidden = cl_array.empty(self.queue, (self.half, self.hidden * 2), dtype=np.float32)
         self.matmulatb_hidden_full = cl_array.empty(self.queue, (self.hidden * 2, self.full), dtype=np.float32)
+        self._wld_row_loss = cl_array.empty(self.queue, (self.batch,), dtype=np.float32)
 
         self._prebind_batch_kernels()
 
-
-    # Currently working on glitch with buffer rings for probably hiddenx2 dimensions.
     def _prebind_batch_kernels(self):
         """Create pre-bound kernel instances for training hot path.
         Fixed scalar args (dimensions, limits) are set once here.
@@ -811,7 +925,6 @@ class OpenCLBackend:
         self._c_full       = np.int32(self.full)
         self._c_half       = np.int32(self.half)
         self._c_hidden2    = np.int32(self.hidden * 2)
-        self._c_limit2     = np.float32(2.0)
         self._c_bxhalf     = np.int32(self.batch * self.half)
         self._c_bxfull     = np.int32(self.batch * self.full)
         self._c_bxhidden2  = np.int32(self.batch * self.hidden * 2)
@@ -843,7 +956,6 @@ class OpenCLBackend:
 
         # coupling_forward_merged_f32(U, ST, V, limit, M, half_N)
         k = cl.Kernel(self._program, "coupling_forward_merged_f32")
-        k.set_arg(3, self._c_limit2)
         k.set_arg(4, self._c_batch)
         k.set_arg(5, self._c_half)
         self._pb_coupling_fwd_merged = k
@@ -852,7 +964,6 @@ class OpenCLBackend:
         k = cl.Kernel(self._program, "fused_forward_invperm_f32")
         k.set_arg(5, self._c_batch)
         k.set_arg(6, self._c_half)
-        k.set_arg(7, self._c_limit2)
         self._pb_fwd_invperm = k
 
         # concat_invperm_f32(U1, U2, inv_perm, out, M, half_N)
@@ -863,15 +974,14 @@ class OpenCLBackend:
 
         # coupling_input_grad_f32(diff, ST, du, limit, N, cols)
         k = cl.Kernel(self._program, "coupling_input_grad_f32")
-        k.set_arg(3, self._c_limit2)
         k.set_arg(4, self._c_bxhalf)       # N = batch*half
         k.set_arg(5, self._c_full)          # cols = st_raw width
         self._pb_input_grad = k
 
         # coupling_backward_f32(V, ST, U, limit, N)
         k = cl.Kernel(self._program, "coupling_backward_f32")
-        k.set_arg(3, self._c_limit2)
         k.set_arg(4, self._c_bxhalf)
+        k.set_arg(5, self._c_full)
         self._pb_coupling_bwd = k
 
         # ---- Subnetwork kernels (two variants per: hidden-layer dims, output-layer dims) ----
@@ -915,23 +1025,23 @@ class OpenCLBackend:
         # fused_sgd_with_transpose_f32(W, W_T, V, G, lr, mom, decay, M, N)
         # Layer 0 weights: (half, hidden*2)
         k = cl.Kernel(self._program, "fused_sgd_with_transpose_f32")
-        k.set_arg(7, self._c_half);  k.set_arg(8, self._c_hidden2)
+        k.set_arg(8, self._c_half);  k.set_arg(9, self._c_hidden2)
         self._pb_sgd_l0 = k
         self._gs_sgd_l0 = (int(self.half * self.hidden * 2),)
 
         # Layer 1 weights: (hidden*2, full)
         k = cl.Kernel(self._program, "fused_sgd_with_transpose_f32")
-        k.set_arg(7, self._c_hidden2);  k.set_arg(8, self._c_full)
+        k.set_arg(8, self._c_hidden2);  k.set_arg(9, self._c_full)
         self._pb_sgd_l1 = k
         self._gs_sgd_l1 = (int(self.hidden * 2 * self.full),)
 
-        # fused_sgd_momentum_bias_f32(B, V, G, lr, mom, N)
+        # fused_sgd_momentum_bias_f32(B, V, G, lr, mom, decay, clip, N)
         k = cl.Kernel(self._program, "fused_sgd_momentum_bias_f32")
-        k.set_arg(5, self._c_hidden2)
+        k.set_arg(7, self._c_hidden2)
         self._pb_sgdb_hid = k
 
         k = cl.Kernel(self._program, "fused_sgd_momentum_bias_f32")
-        k.set_arg(5, self._c_full)
+        k.set_arg(7, self._c_full)
         self._pb_sgdb_full = k
 
         # subtract_divide_loss_f32(A, B, out, partial_sums, total, D)
@@ -959,16 +1069,14 @@ class OpenCLBackend:
         # fused_coupling_grads_concat_f32(s1_outer, diff2, diff1_total, u1, st2_raw,
         #                                  diffs_st1, diffs_st2, s_limit, s_clip, t_clip, M, half_N)
         k = cl.Kernel(self._program, "fused_coupling_grads_concat_f32")
-        k.set_arg(7, self._c_limit2)       # s_limit always 2.0
-        # args 8 (s_clip_limit), 9 (t_clip_limit) set at call time
+        # args 7 (s_limit), 8 (s_clip_limit), 9 (t_clip_limit) set at call time
         k.set_arg(10, self._c_batch)
         k.set_arg(11, self._c_half)
         self._pb_fused_grads_concat = k
 
         # coupling_s_outer_concat_f32(diff, U, ST, combined, s_outer, s_limit, clip, M, half_N)
         k = cl.Kernel(self._program, "coupling_s_outer_concat_f32")
-        k.set_arg(5, self._c_limit2)       # s_limit always 2.0
-        # arg 6 (clip_limit) set at call time
+        # args 5 (s_limit), 6 (clip_limit) set at call time
         k.set_arg(7, self._c_batch)
         k.set_arg(8, self._c_half)
         self._pb_s_outer_concat = k
@@ -980,18 +1088,30 @@ class OpenCLBackend:
 
         # coupling_backward_outer_concat_f32(diff, U, ST, out, s_limit, s_clip, t_clip, M, half_N)
         k = cl.Kernel(self._program, "coupling_backward_outer_concat_f32")
-        k.set_arg(4, self._c_limit2)       # s_limit always 2.0
-        # args 5 (s_clip_limit), 6 (t_clip_limit) set at call time
+        # args 4 (s_limit), 5 (s_clip_limit), 6 (t_clip_limit) set at call time
         k.set_arg(7, self._c_batch)
         k.set_arg(8, self._c_half)
         self._pb_bwd_outer_concat = k
 
         # coupling_backward_input_grad_merged_f32(diff, ST, du, limit, N, cols)
         k = cl.Kernel(self._program, "coupling_backward_input_grad_merged_f32")
-        k.set_arg(3, self._c_limit2)
         k.set_arg(4, self._c_bxhalf)       # N = batch*half
         k.set_arg(5, self._c_full)          # cols = st_raw width
         self._pb_bwd_input_grad = k
+
+        # weighted_loss_diffs_f32(inputs, targets, outputs, train_diffs, row_loss, alpha, beta, inv_n, B, D)
+        k = cl.Kernel(self._program, "weighted_loss_diffs_f32")
+        k.set_arg(8, self._c_batch)
+        k.set_arg(9, self._c_full)
+        self._pb_wld = k
+        self._wld_gs = (int(self.batch * 256),)
+        self._wld_ls = (256,)
+
+        self._sdl_total = cl_array.empty(self.queue, (1,), dtype=np.float32)
+        k = cl.Kernel(self._program, "reduce_sum_f32")
+        k.set_arg(1, self._sdl_total.data)
+        k.set_arg(2, np.int32(ng))
+        self._pb_reduce_sdl = k
 
     def _cached_f32(self, val):
         """Return a cached np.float32 for a given Python float."""
@@ -1115,7 +1235,7 @@ class OpenCLBackend:
         )
         return out
 
-    def add(self, a, b): # Unused
+    def add(self, a, b):
         # Device fast-path when either operand is already on device.
         if self.is_device_array(a) or self.is_device_array(b):
             ad = self.to_device(a)
@@ -1130,7 +1250,6 @@ class OpenCLBackend:
                     if bd.shape[0] == 1 and ad.shape[0] >= 1:
                         m, n = ad.shape
                         out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
-                        # print(m,n)
                         self._add_row_broadcast_kernel(
                             self.queue,
                             (int(m), int(n)),
@@ -1144,7 +1263,6 @@ class OpenCLBackend:
                         return out
                     if ad.shape[0] == 1 and bd.shape[0] >= 1:
                         m, n = bd.shape
-                        # print(m,n)
                         out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
                         self._add_row_broadcast_kernel(
                             self.queue,
@@ -1189,7 +1307,7 @@ class OpenCLBackend:
             return xd
         return None
 
-    def apply_activation_derivative(self, x, func_name): # Unused?
+    def apply_activation_derivative(self, x, func_name):
         xd = self.to_device(x)
         if func_name == "leakyReLU":
             n = xd.size
@@ -1243,13 +1361,14 @@ class OpenCLBackend:
     
     def permute_split(self, x, perm):
         x = self.to_device(x, dtype=np.float32)
+        perm_dev = self.to_device(perm, dtype=np.int32)
         m, n = x.shape
         if m == self.batch and n == self.full:
             out1 = self._ring_batch_half.next()
             out2 = self._ring_batch_half.next()
             k = self._pb_permute_split
             k.set_arg(0, x.data)
-            k.set_arg(1, perm.data)
+            k.set_arg(1, perm_dev.data)
             k.set_arg(2, out1.data)
             k.set_arg(3, out2.data)
             cl.enqueue_nd_range_kernel(self.queue, k, self._gs_b_full, None)
@@ -1263,7 +1382,7 @@ class OpenCLBackend:
             out2 = cl_array.empty(self.queue, (m, n//2), dtype=np.float32)
         self._permute_split_kernel(
             self.queue, (int(m), int(n)), None,
-            x.data, perm.data, out1.data, out2.data,
+            x.data, perm_dev.data, out1.data, out2.data,
             np.int32(m), np.int32(n), np.int32(n//2),
         )
         return out1, out2
@@ -1278,6 +1397,7 @@ class OpenCLBackend:
             k.set_arg(0, u.data)
             k.set_arg(1, st_raw.data)
             k.set_arg(2, out.data)
+            k.set_arg(3, self._cached_f32(limit))
             cl.enqueue_nd_range_kernel(self.queue, k, self._gs_b_half, None)
             return out
         if m == 1 and n == self.half:
@@ -1305,6 +1425,7 @@ class OpenCLBackend:
             k.set_arg(2, perm_dev.data)
             k.set_arg(3, st_raw.data)
             k.set_arg(4, out.data)
+            k.set_arg(7, self._cached_f32(limit))
             cl.enqueue_nd_range_kernel(self.queue, k, self._gs_b_full, None)
             return out
         if m == 1 and n == self.half:
@@ -1353,6 +1474,7 @@ class OpenCLBackend:
             k.set_arg(0, dd.data)
             k.set_arg(1, std.data)
             k.set_arg(2, out.data)
+            k.set_arg(3, self._cached_f32(limit))
             cl.enqueue_nd_range_kernel(self.queue, k, self._gs_bxhalf, None)
             return out
         out = cl_array.empty(self.queue, dd.shape, dtype=np.float32)
@@ -1375,6 +1497,7 @@ class OpenCLBackend:
             k.set_arg(0, vd.data)
             k.set_arg(1, std.data)
             k.set_arg(2, out.data)
+            k.set_arg(3, self._cached_f32(limit))
             cl.enqueue_nd_range_kernel(self.queue, k, self._gs_bxhalf, None)
             return out
         if m == 1 and n == self.half:
@@ -1385,7 +1508,7 @@ class OpenCLBackend:
         self._coupling_backward_kernel(
             self.queue, (int(total),), None,
             vd.data, std.data, out.data,
-            np.float32(limit), np.int32(total),
+            np.float32(limit), np.int32(total), np.int32(std.shape[1]),
         )
         return out
 
@@ -1563,7 +1686,7 @@ class OpenCLBackend:
         )
         return out
 
-    def fused_sgd_update(self, weights, weights_t, velocity, gradient, lr, momentum, decay_factor):
+    def fused_sgd_update(self, weights, weights_t, velocity, gradient, lr, momentum, decay_factor, clip_limit):
         m, n = weights.shape
         total = m * n
         # Check for pre-bound layer-specific kernels
@@ -1578,7 +1701,7 @@ class OpenCLBackend:
             self._fused_sgd_transpose_kernel(
                 self.queue, (int(total),), None,
                 weights.data, weights_t.data, velocity.data, gradient.data,
-                np.float32(lr), np.float32(momentum), np.float32(decay_factor),
+                np.float32(lr), np.float32(momentum), np.float32(decay_factor), np.float32(clip_limit), 
                 np.int32(m), np.int32(n),
             )
             return
@@ -1589,9 +1712,10 @@ class OpenCLBackend:
         k.set_arg(4, self._cached_f32(lr))
         k.set_arg(5, self._cached_f32(momentum))
         k.set_arg(6, self._cached_f32(decay_factor))
+        k.set_arg(7, self._cached_f32(clip_limit))
         cl.enqueue_nd_range_kernel(self.queue, k, gs, None)
 
-    def fused_sgd_bias_update(self, bias, velocity, gradient, lr, momentum):
+    def fused_sgd_bias_update(self, bias, velocity, gradient, lr, momentum, decay_factor, clip_limit):
         n = bias.size
         if n == 2 * self.hidden:
             k = self._pb_sgdb_hid
@@ -1603,7 +1727,7 @@ class OpenCLBackend:
             self._fused_sgd_bias_kernel(
                 self.queue, (int(n),), None,
                 bias.data, velocity.data, gradient.data,
-                np.float32(lr), np.float32(momentum), np.int32(n),
+                np.float32(lr), np.float32(momentum), np.float32(decay_factor), np.float32(clip_limit), np.int32(n)
             )
             return
         k.set_arg(0, bias.data)
@@ -1611,6 +1735,8 @@ class OpenCLBackend:
         k.set_arg(2, gradient.data)
         k.set_arg(3, self._cached_f32(lr))
         k.set_arg(4, self._cached_f32(momentum))
+        k.set_arg(5, self._cached_f32(decay_factor))
+        k.set_arg(6, self._cached_f32(clip_limit))
         cl.enqueue_nd_range_kernel(self.queue, k, gs, None)
 
     def subtract_divide_loss(self, a, b, d):
@@ -1626,8 +1752,12 @@ class OpenCLBackend:
             k.set_arg(2, out.data)
             k.set_arg(3, ps.data)
             k.set_arg(5, self._cached_f32(d))
+            # cl.enqueue_nd_range_kernel(self.queue, k, self._sdl_gs, self._sdl_ls)
             cl.enqueue_nd_range_kernel(self.queue, k, self._sdl_gs, self._sdl_ls)
-            return out, ps
+            rk = self._pb_reduce_sdl
+            rk.set_arg(0, ps.data)
+            cl.enqueue_nd_range_kernel(self.queue, rk, (256,), (256,))
+            return out, self._sdl_total
         # Generic fallback
         out = cl_array.empty(self.queue, (m, n), dtype=np.float32)
         total = m * n
@@ -1640,7 +1770,12 @@ class OpenCLBackend:
             a.data, b.data, out.data, partial_sums.data,
             np.int32(total), np.float32(d),
         )
-        return out, partial_sums
+        total_buf = cl_array.empty(self.queue, (1,), dtype=np.float32)
+        self._reduce_sum_kernel(
+            self.queue, (256,), (256,),
+            partial_sums.data, total_buf.data, np.int32(num_groups),
+        )
+        return out, total_buf
     
     def fused_coupling_grads_concat(self, s1_outer, diff2, diff1_total, u1, st2_raw,
                                 s_limit=2.0, s_clip_limit=1.0, t_clip_limit=0.5):
@@ -1664,6 +1799,7 @@ class OpenCLBackend:
             k.set_arg(4, st2_raw.data)
             k.set_arg(5, out1.data)
             k.set_arg(6, out2.data)
+            k.set_arg(7, self._cached_f32(s_limit))
             k.set_arg(8, self._cached_f32(s_clip_limit))
             k.set_arg(9, self._cached_f32(t_clip_limit))
             cl.enqueue_nd_range_kernel(self.queue, k, self._gs_b_full, None)
@@ -1697,6 +1833,7 @@ class OpenCLBackend:
             k.set_arg(2, st_raw.data)
             k.set_arg(3, out_combined.data)
             k.set_arg(4, out_s_outer.data)
+            k.set_arg(5, self._cached_f32(s_limit))
             k.set_arg(6, self._cached_f32(clip_limit))
             cl.enqueue_nd_range_kernel(self.queue, k, self._gs_b_full, None)
             return out_combined, out_s_outer
@@ -1750,6 +1887,7 @@ class OpenCLBackend:
             k.set_arg(1, u.data)
             k.set_arg(2, st_raw.data)
             k.set_arg(3, out.data)
+            k.set_arg(4, self._cached_f32(s_limit))
             k.set_arg(5, self._cached_f32(s_clip_limit))
             k.set_arg(6, self._cached_f32(t_clip_limit))
             cl.enqueue_nd_range_kernel(self.queue, k, self._gs_b_full, None)
@@ -1775,6 +1913,7 @@ class OpenCLBackend:
             k.set_arg(0, dd.data)
             k.set_arg(1, std.data)
             k.set_arg(2, out.data)
+            k.set_arg(3, self._cached_f32(limit))
             cl.enqueue_nd_range_kernel(self.queue, k, self._gs_bxhalf, None)
             return out
         out = cl_array.empty(self.queue, dd.shape, dtype=np.float32)
@@ -1786,3 +1925,39 @@ class OpenCLBackend:
             np.float32(limit), np.int32(total), np.int32(cols),
         )
         return out
+    
+    def weighted_loss_diffs(self, inputs, targets, outputs, alpha, beta, inv_n):
+        """Fused on-device: compute train_diffs (B,D) and row_loss (B,).
+
+        train_diffs[i] = (target-output) * ((1-beta) + beta*w_norm) * inv_n
+        row_loss[row]  = 0.5 * sum_col(fwd_coeff * residual^2)
+        loss = float(np.mean(backend.to_host(row_loss)))
+        """
+        inputs  = self.to_device(inputs,  dtype=np.float32)
+        targets = self.to_device(targets, dtype=np.float32)
+        outputs = self.to_device(outputs, dtype=np.float32)
+        m, n = inputs.shape
+        if m == self.batch and n == self.full:
+            out_diffs = self._ring_batch_full.next()
+            k = self._pb_wld
+            k.set_arg(0, inputs.data)
+            k.set_arg(1, targets.data)
+            k.set_arg(2, outputs.data)
+            k.set_arg(3, out_diffs.data)
+            k.set_arg(4, self._wld_row_loss.data)
+            k.set_arg(5, self._cached_f32(float(alpha)))
+            k.set_arg(6, self._cached_f32(float(beta)))
+            k.set_arg(7, self._cached_f32(float(inv_n)))
+            cl.enqueue_nd_range_kernel(self.queue, k, self._wld_gs, self._wld_ls)
+            return out_diffs, self._wld_row_loss
+        # Generic fallback for non-standard batch sizes
+        out_diffs = cl_array.empty(self.queue, (m, n), dtype=np.float32)
+        row_loss  = cl_array.empty(self.queue, (m,),   dtype=np.float32)
+        self._weighted_loss_diffs_kernel(
+            self.queue, (int(m * 256),), (256,),
+            inputs.data, targets.data, outputs.data,
+            out_diffs.data, row_loss.data,
+            np.float32(alpha), np.float32(beta), np.float32(inv_n),
+            np.int32(m), np.int32(n),
+        )
+        return out_diffs, row_loss

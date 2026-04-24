@@ -22,14 +22,14 @@ class SmileyGenerator:
         scale = s / 28.0
         line_w = max(1, int(round(1.0 * scale * self.rng.uniform(0.8, 1.4))))
 
-        # Randomized face center (slight jitter)
-        cx = s // 2 + self.rng.uniform(-1.5, 1.5) * scale
-        cy = s // 2 + self.rng.uniform(-1.5, 1.5) * scale
+        # Randomized face center (spread more freely across the image)
+        cx = s // 2 + self.rng.uniform(-4.5, 4.5) * scale
+        cy = s // 2 + self.rng.uniform(-4.5, 4.5) * scale
 
         # --- Mouth (arc on an ellipse) ---
-        mouth_w = self.rng.uniform(8, 16) * scale   # ellipse width
-        mouth_h = self.rng.uniform(4, 10) * scale    # ellipse height (curvature)
-        mouth_y_offset = self.rng.uniform(1.5, 5) * scale  # how far below center
+        mouth_w = self.rng.uniform(6, 22) * scale   # ellipse width (wider range)
+        mouth_h = self.rng.uniform(3, 12) * scale    # ellipse height (curvature)
+        mouth_y_offset = self.rng.uniform(1.0, 6) * scale  # how far below center
 
         mouth_cy = cy + mouth_y_offset
         mouth_bbox = [
